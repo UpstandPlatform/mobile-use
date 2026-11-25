@@ -1,6 +1,6 @@
 # Release and artifact verification
 
-The Release workflow runs on a `vMAJOR.MINOR.PATCH` tag reachable from `main`. It reruns CI, builds the artifacts from the tagged commit, and verifies the downloadable files before publishing. A failed run can be rerun from the same tag. The workflow declines to replace a published GitHub release.
+The Release workflow runs on a `vMAJOR.MINOR.PATCH` tag reachable from `main`. It reruns CI, builds the artifacts from the tagged commit, and verifies the downloadable files before publishing. You can run a repaired workflow from `main` against an existing release tag with `gh workflow run release.yml --ref main -f tag=v0.1.0`. The tag and the source commit stay fixed. The workflow declines to replace a published GitHub release.
 
 ## Published artifacts
 

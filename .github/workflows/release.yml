@@ -3,12 +3,17 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build with the workflow on main
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -18,26 +23,39 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
       android-code: ${{ steps.version.outputs.android-code }}
+      source: ${{ steps.source.outputs.sha }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
       - id: version
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          test "$GITHUB_REF_TYPE" = tag
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            test "$GITHUB_REF" = refs/heads/main
+          else
+            test "$GITHUB_REF_TYPE" = tag
+          fi
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
             echo 'Release tags must use vMAJOR.MINOR.PATCH with components between 0 and 999.' >&2
             exit 1
           fi
           code=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3] + 1 ))
+          printf 'tag=%s\nversion=%s\nandroid-code=%s\n' "$TAG" "${TAG#v}" "$code" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: source
+        run: |
           git merge-base --is-ancestor HEAD origin/main
-          printf 'tag=%s\nversion=%s\nandroid-code=%s\n' "$GITHUB_REF_NAME" "${GITHUB_REF_NAME#v}" "$code" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   checks:
     needs: version
     uses: ./.github/workflows/ci.yml
+    with:
+      source: ${{ needs.version.outputs.source }}
 
   desktop:
     needs: version
@@ -55,6 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.source }}
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -100,15 +119,18 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.source }}
           persist-credentials: false
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0
       - name: Build Android release packages
         run: |
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
           cd android
           bash gradlew :companion:assembleRelease :control:assembleRelease \
             "-PmobileUseVersion=$RELEASE_VERSION" "-PmobileUseVersionCode=$ANDROID_VERSION_CODE"
@@ -147,6 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.source }}
           persist-credentials: false
       - id: registry
         run: printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -167,7 +190,7 @@ jobs:
           tags: ${{ steps.registry.outputs.image }}:${{ env.RELEASE_TAG }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.version.outputs.source }}
             org.opencontainers.image.version=${{ env.RELEASE_TAG }}
             org.opencontainers.image.licenses=Apache-2.0
           build-args: MOBILE_USE_VERSION=${{ env.RELEASE_TAG }}
@@ -208,6 +231,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.source }}
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:

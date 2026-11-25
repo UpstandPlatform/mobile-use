@@ -1,0 +1,22 @@
+replicas: 2
+image: mobile-use:0.1.0
+imagePullPolicy: IfNotPresent
+origin: ""
+oidcIssuer: ""
+oidcAudience: ""
+consoleClient: mobile-use-console
+connectorAllowlist: ""
+relayCommonName: relay-replica
+databaseSecret: mobile-use-database
+httpTLSSecret: mobile-use-http-tls
+relayTLSSecret: mobile-use-relay-tls
+companionEnabled: false
+turnURLs: ""
+turnRelayOnly: false
+turnSecret: mobile-use-turn
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

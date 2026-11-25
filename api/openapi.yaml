@@ -1,0 +1,229 @@
+openapi: 3.1.0
+info:
+  title: mobile-use API
+  version: 1.0.0
+security:
+  - bearer: []
+paths:
+  /v1/me:
+    get:
+      operationId: identity
+      responses:
+        '200': {description: Current identity and workspace}
+  /v1/devices:
+    get:
+      operationId: devicesList
+      responses:
+        '200': {description: Device inventory in the caller's scope}
+  /v1/devices/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: deviceCapabilities
+      responses:
+        '200': {description: Device capabilities and current availability}
+    put:
+      operationId: enrollDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Enrollment'}
+      responses:
+        '200': {description: Updated enrollment}
+  /v1/sessions:
+    get:
+      operationId: sessionsList
+      responses:
+        '200': {description: Pending and active sessions}
+    post:
+      operationId: startSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/StartSession'}
+      responses:
+        '201': {description: Pending approval or active session}
+  /v1/sessions/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: sessionStatus
+      responses:
+        '200': {description: Current session state}
+  /v1/sessions/{id}/{verb}:
+    parameters:
+      - {$ref: '#/components/parameters/id'}
+      - name: verb
+        in: path
+        required: true
+        schema: {type: string, enum: [approve, deny, presence, pause, resume, takeover, end]}
+    post:
+      operationId: changeSession
+      responses:
+        '200': {description: Updated session state}
+  /v1/sessions/{id}/operations:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    post:
+      operationId: runOperation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Operation'}
+      responses:
+        '200':
+          description: Operation result. Check state and error before using the response.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Result'}
+        default:
+          description: Request or authorization failed
+  /v1/sessions/{id}/video:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: getVideoNetworkConfiguration
+      responses:
+        '200': {description: Authorized ICE servers, short-lived TURN credentials, and the transport policy}
+    post:
+      operationId: openVideoViewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, sdp]
+              properties:
+                type: {const: offer}
+                sdp: {type: string, maxLength: 65536}
+      responses:
+        '201': {description: WebRTC answer and viewer ID}
+  /v1/sessions/{id}/video/{viewer}:
+    parameters:
+      - {$ref: '#/components/parameters/id'}
+      - name: viewer
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      operationId: closeVideoViewer
+      responses:
+        '204': {description: Viewer closed}
+  /v1/audit:
+    get:
+      operationId: auditList
+      responses:
+        '200': {description: Recent workspace audit metadata}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  parameters:
+    id: {name: id, in: path, required: true, schema: {type: string}}
+  schemas:
+    Capability:
+      type: string
+      enum: [screen, ui_tree, touch, text, apps, browser, camera, microphone, multi_touch]
+    Enrollment:
+      type: object
+      required: [label, owner, profile]
+      properties:
+        label: {type: string, maxLength: 128}
+        owner: {type: string}
+        profile: {enum: [personal, dedicated]}
+        enabled: {type: boolean}
+        grants:
+          type: array
+          items:
+            type: object
+            required: [subject, capabilities]
+            properties:
+              subject: {type: string}
+              capabilities: {type: array, items: {$ref: '#/components/schemas/Capability'}}
+    StartSession:
+      type: object
+      required: [device_id, purpose, capabilities]
+      properties:
+        device_id: {type: string}
+        purpose: {type: string, minLength: 3, maxLength: 256}
+        capabilities: {type: array, minItems: 1, uniqueItems: true, items: {$ref: '#/components/schemas/Capability'}}
+    Point:
+      type: object
+      required: [x, y]
+      properties:
+        x: {type: number, minimum: 0, exclusiveMaximum: 1}
+        y: {type: number, minimum: 0, exclusiveMaximum: 1}
+    Operation:
+      type: object
+      required: [kind]
+      properties:
+        id: {type: string, description: Supply a unique ID when dispatching a mutation or requesting a sensor.}
+        kind: {enum: [observe, act, apps_list, app_launch, app_terminate, app_install, app_reset, browser_contexts, browser_observe, browser_act, sensor_request, sensor_status, artifact_get]}
+        app_id: {type: string}
+        maintenance:
+          type: object
+          required: [artifact_id, confirm]
+          properties:
+            artifact_id: {type: string}
+            confirm: {type: string, description: The operation verb and catalog ID separated by one space.}
+        observe:
+          type: object
+          properties:
+            screen: {type: boolean}
+            tree: {type: boolean}
+            wait_for: {type: string}
+            timeout_ms: {type: integer, minimum: 0, maximum: 8000}
+        action:
+          type: object
+          required: [type, frame_id]
+          properties:
+            type: {enum: [tap, long_press, swipe, drag, pinch, type, key]}
+            frame_id: {type: string}
+            node_id: {type: string}
+            point: {$ref: '#/components/schemas/Point'}
+            end: {$ref: '#/components/schemas/Point'}
+            second_point: {$ref: '#/components/schemas/Point'}
+            second_end: {$ref: '#/components/schemas/Point'}
+            duration_ms: {type: integer, minimum: 0, maximum: 3000}
+            text: {type: string}
+            key: {enum: [home, back, overview, enter, backspace, volume_up, volume_down]}
+        browser:
+          type: object
+          required: [context_id]
+          properties:
+            context_id: {type: string}
+            document_id: {type: string}
+            type: {enum: [navigate, click, fill, scroll]}
+            url: {type: string, format: uri}
+            selector: {type: string}
+            text: {type: string}
+            delta_y: {type: integer}
+        sensor:
+          type: object
+          required: [type]
+          properties:
+            type: {enum: [camera, microphone]}
+            request_id: {type: string}
+            duration_seconds: {type: integer, minimum: 0, maximum: 15}
+    Result:
+      type: object
+      required: [id, state]
+      properties:
+        id: {type: string}
+        state: {enum: [succeeded, failed, executing, outcome_unknown]}
+        observation: {type: object}
+        apps: {type: array, items: {type: string}}
+        contexts: {type: array, items: {type: object}}
+        page: {type: object}
+        sensor: {type: object}
+        artifact:
+          type: object
+          required: [mime, data]
+          properties:
+            mime: {enum: [image/png, image/jpeg, audio/wav]}
+            data: {type: string, contentEncoding: base64}
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}

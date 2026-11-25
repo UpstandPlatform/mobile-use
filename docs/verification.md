@@ -1,0 +1,27 @@
+# Verification and release status
+
+## Automated checks
+
+- `go test ./... -count=1` covers the HTTP and Streamable HTTP MCP paths, image output, access boundaries, operation idempotency, competing leases, pause and takeover, and companion pairing, projection frames, photo retrieval, and revocation. The iOS contract test exercises WebDriver request shape and secure-field handoff with a protocol fixture.
+- Set `MOBILE_USE_TEST_POSTGRES` to a disposable PostgreSQL database owned by a login with `NOSUPERUSER` and `NOBYPASSRLS`. The integration suite creates unique workspaces and tests visibility and write isolation with and without a workspace context.
+- `npm --prefix web ci` and `npm --prefix web run build` check and bundle the console. `android/gradlew :companion:assembleDebug :companion:lintDebug` builds and statically checks the Android companion.
+- `python tests/smoke_android.py <origin> <local-config.json> [--connector <name>]` exercises enrollment, native UI, screenshots, stale references, device input, pause, resume, and revocation on a disposable Android emulator. The script selects virtual devices only.
+- Build and install `:fixture:assembleDebug` to enable the native input and inspectable WebView test surface. Add `--helper` after installing and enabling the trusted ADB helper to check Unicode and pinch. Add `--browser-fixture` to exercise WebView inspection and actions. The fixture is a separate test-only app.
+- Add `--maintenance-fixture` with the fixture APK in a connector catalog to verify installation and app data reset on the disposable emulator. The test checks rejection when the confirmation is missing, the requester is an agent, or the device has a personal profile.
+- For the browser smoke test, configure scrcpy and add the disposable fixture APK as `fixture-app` in the catalog. Sign in as the workstation administrator and select the dedicated emulator with no session open. Run `playwright-cli run-code --filename=tests/console_android_e2e.js` in that browser session. It exercises capture, live video, pause, resume, app reset, and stop at desktop and mobile widths. Only run this against the disposable emulator and fixture package.
+- `python tests/smoke_companion.py <origin> <local-config.json> --camera` covers approval, projection, microphone, and camera on a paired Android 16 emulator named `emulator-5580`. Pair it against a trusted TLS endpoint before running the test.
+- Set `MOBILE_USE_TEST_SCRCPY` to the official scrcpy 4.0 server file and `MOBILE_USE_TEST_EMULATOR` to a disposable emulator serial to run the real scrcpy capture test. Set `MOBILE_USE_TEST_FFMPEG=1` to transcode a synthetic WebDriverAgent-style MJPEG stream with the installed FFmpeg. The TURN test checks the selected ICE candidates and receipt of RTP through a loopback TURN server.
+- `TestFleetControlPlane` enrolls 100 fixture-backed devices and exercises 25 concurrent sessions through the HTTP API. `TestTwoReplicaCommandAndVideoRouting` tests command and video forwarding over mTLS, terminates the first relay, and checks that the remaining replica accepts new leases and fences the old generation after connector reconnection.
+
+## Verified on the Windows development host
+
+The Android 16 emulator completed native control over the certificate-authenticated remote connector, Unicode entry and pinch through the Android control helper, WebView DOM inspection and actions, and catalog-pinned APK installation and app data reset. The companion paired over HTTPS, approved a session on-device, captured a screen after Android consent, and returned a JPEG camera photo and a short WAV clip. SQLite and PostgreSQL passed the integration suite, including the 100-device and 25-session fixture test. The restricted PostgreSQL role can be provisioned by the Compose initialization script. The CLI answered the MCP stdio handshake.
+
+Microsoft Edge was used to exercise console sign-in, device inventory, session approval, screen capture, pause, resume, stop, and the dedicated app reset flow at a 390 px viewport. It decoded live 576 × 1280 video from both workstation capture and the mTLS connector. The loopback TURN test confirmed both selected ICE candidates were relay candidates. Docker Compose configuration and Helm lint passed, the Linux image built, and the macOS arm64 binary cross-compiled.
+
+## Remaining before production certification
+
+- Run the physical Android OEM and OS matrix, and the iPhone and Simulator matrix on Apple Silicon with provisioned WebDriverAgent. Validate phone browser contexts on the certified Chrome and Safari versions. Run the complete Claude Code and Codex journeys on their supported clients.
+- Certify Android WebRTC performance across the hardware and network matrix, run the iOS MJPEG adapter against signed WDA on physical devices, and complete the direct iOS H.264 tier. Companion screen sharing uploads bounded JPEG frames. The companion and ADB profiles are enrolled separately.
+- Complete physical fleet provisioning and device-wide reset, iOS app deployment and reset, workspace and group administration, deployed HA failover, companion data-plane failover, and database restore drills that verify session fencing.
+- Finish signed distribution, Android developer verification, release provenance, operational dashboards, and independent security review. Measure sustained media throughput and latency at 100 enrolled devices and 25 active sessions on the intended network and hardware.

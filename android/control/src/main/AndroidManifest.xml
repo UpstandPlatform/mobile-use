@@ -1,0 +1,4 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:allowBackup="false" android:label="mobile-use ADB control" android:usesCleartextTraffic="false" />
+    <instrumentation android:name=".ControlInstrumentation" android:targetPackage="org.mobileuse.control" android:functionalTest="true" />
+</manifest>

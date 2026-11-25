@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: mobileuse
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:?Set a separate PostgreSQL bootstrap password}
+      MOBILE_USE_DB_ROLE_PASSWORD: ${POSTGRES_PASSWORD:?Set the mobileuse runtime role password}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./postgres/initialize.sh:/docker-entrypoint-initdb.d/10-mobile-use.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U mobileuse -d mobileuse]
+      interval: 5s
+      retries: 12
+    restart: unless-stopped
+  mobile-use:
+    build:
+      context: ..
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MOBILE_USE_POSTGRES: ${MOBILE_USE_POSTGRES:?Set the database DSN}
+      MOBILE_USE_DIGEST_KEY: ${MOBILE_USE_DIGEST_KEY:?Set a 32-byte hexadecimal key}
+      MOBILE_USE_LISTEN: 0.0.0.0:8443
+      MOBILE_USE_ORIGIN: ${MOBILE_USE_ORIGIN:?Set the private HTTPS origin}
+      MOBILE_USE_HTTP_CERT: /run/tls/http.crt
+      MOBILE_USE_HTTP_KEY: /run/tls/http.key
+      MOBILE_USE_OIDC_ISSUER: ${MOBILE_USE_OIDC_ISSUER:?Set the HTTPS identity issuer}
+      MOBILE_USE_OIDC_AUDIENCE: ${MOBILE_USE_OIDC_AUDIENCE:?Set the resource audience}
+      MOBILE_USE_CONSOLE_CLIENT: ${MOBILE_USE_CONSOLE_CLIENT:-mobile-use-console}
+      MOBILE_USE_RELAY_LISTEN: 0.0.0.0:9443
+      MOBILE_USE_RELAY_CERT: /run/tls/relay.crt
+      MOBILE_USE_RELAY_KEY: /run/tls/relay.key
+      MOBILE_USE_RELAY_CA: /run/tls/relay-ca.crt
+      MOBILE_USE_CONNECTORS: ${MOBILE_USE_CONNECTORS:?Set connector mappings}
+      MOBILE_USE_TURN_URLS: ${MOBILE_USE_TURN_URLS:-}
+      MOBILE_USE_TURN_SECRET: ${MOBILE_USE_TURN_SECRET:-}
+      MOBILE_USE_TURN_RELAY_ONLY: ${MOBILE_USE_TURN_RELAY_ONLY:-0}
+    volumes:
+      - ${MOBILE_USE_TLS_DIRECTORY:?Set the certificate directory}:/run/tls:ro
+    ports:
+      - "${MOBILE_USE_BIND_IP:-127.0.0.1}:8443:8443"
+      - "${MOBILE_USE_BIND_IP:-127.0.0.1}:9443:9443"
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+
+volumes:
+  postgres:

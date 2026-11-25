@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package mobileuse.relay.v1;
+
+import "google/protobuf/wrappers.proto";
+
+// Each BytesValue carries one UTF-8 JSON relay envelope. Version 1 uses
+// hello, ready, inventory, execute, result, and stop messages. The server
+// attaches the workspace and connector identity from the client certificate.
+service Relay {
+  rpc Connect(stream google.protobuf.BytesValue) returns (stream google.protobuf.BytesValue);
+  rpc Forward(google.protobuf.BytesValue) returns (google.protobuf.BytesValue);
+  rpc PublishVideo(stream google.protobuf.BytesValue) returns (google.protobuf.BytesValue);
+  rpc WatchVideo(google.protobuf.BytesValue) returns (stream google.protobuf.BytesValue);
+}

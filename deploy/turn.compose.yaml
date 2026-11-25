@@ -1,0 +1,31 @@
+services:
+  turn:
+    image: coturn/coturn:4.19.2-r0
+    network_mode: host
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /var/tmp
+    volumes:
+      - ${MOBILE_USE_TURN_TLS_DIRECTORY:?Set the TURN certificate directory}:/run/turn:ro
+    command:
+      - -n
+      - --log-file=stdout
+      - --no-cli
+      - --no-loopback-peers
+      - --no-multicast-peers
+      - --no-tcp-relay
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${MOBILE_USE_TURN_SECRET:?Set the same shared secret as the API}
+      - --realm=${MOBILE_USE_TURN_REALM:?Set the private TURN DNS name}
+      - --listening-ip=${MOBILE_USE_TURN_LISTEN_IP:?Set a Linux host interface address}
+      - --relay-ip=${MOBILE_USE_TURN_LISTEN_IP:?Set a Linux host interface address}
+      - --external-ip=${MOBILE_USE_TURN_ADVERTISED_IP:?Set the advertised IP or external/internal mapping}
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --min-port=40000
+      - --max-port=40500
+      - --cert=/run/turn/tls.crt
+      - --pkey=/run/turn/tls.key

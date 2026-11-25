@@ -1,0 +1,1 @@
+deploy/postgres/initialize.sh text eol=lf

@@ -1,0 +1,122 @@
+{{- $name := printf "%s-mobile-use" .Release.Name | trunc 50 | trimSuffix "-" -}}
+{{- if and .Values.companionEnabled (gt (int .Values.replicas) 1) -}}
+{{- fail "The companion media path requires a single replica. Set companionEnabled=false for this HA chart." -}}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mobile-use
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+    - name: mcp-relay
+      port: 9443
+      targetPort: tls-relay
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-peer
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mobile-use
+  ports:
+    - name: tls-relay
+      port: 9443
+      targetPort: tls-relay
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  serviceName: {{ $name }}-peer
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mobile-use
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/name: mobile-use
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+      containers:
+        - name: control-plane
+          image: {{ required "Set the mobile-use container image" .Values.image | quote }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          ports:
+            - {name: https, containerPort: 8443}
+            - {name: tls-relay, containerPort: 9443}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: MOBILE_USE_LISTEN, value: "0.0.0.0:8443"}
+            - {name: MOBILE_USE_RELAY_LISTEN, value: "0.0.0.0:9443"}
+            - {name: MOBILE_USE_RELAY_ADDRESS, value: "$(POD_NAME).{{ $name }}-peer.$(POD_NAMESPACE).svc:9443"}
+            - {name: MOBILE_USE_ORIGIN, value: {{ required "Set the private HTTPS origin" .Values.origin | quote }}}
+            - {name: MOBILE_USE_OIDC_ISSUER, value: {{ required "Set the HTTPS OIDC issuer" .Values.oidcIssuer | quote }}}
+            - {name: MOBILE_USE_OIDC_AUDIENCE, value: {{ required "Set the OIDC audience" .Values.oidcAudience | quote }}}
+            - {name: MOBILE_USE_CONSOLE_CLIENT, value: {{ .Values.consoleClient | quote }}}
+            - {name: MOBILE_USE_CONNECTORS, value: {{ .Values.connectorAllowlist | quote }}}
+            - {name: MOBILE_USE_RELAY_PEERS, value: {{ .Values.relayCommonName | quote }}}
+            - {name: MOBILE_USE_COMPANION_DISABLED, value: {{ ternary "0" "1" .Values.companionEnabled | quote }}}
+            - {name: MOBILE_USE_TURN_URLS, value: {{ .Values.turnURLs | quote }}}
+            - {name: MOBILE_USE_TURN_RELAY_ONLY, value: {{ ternary "1" "0" .Values.turnRelayOnly | quote }}}
+            {{- if .Values.turnURLs }}
+            - name: MOBILE_USE_TURN_SECRET
+              valueFrom: {secretKeyRef: {name: {{ .Values.turnSecret }}, key: secret}}
+            {{- end }}
+            - name: MOBILE_USE_POSTGRES
+              valueFrom: {secretKeyRef: {name: {{ .Values.databaseSecret }}, key: dsn}}
+            - name: MOBILE_USE_DIGEST_KEY
+              valueFrom: {secretKeyRef: {name: {{ .Values.databaseSecret }}, key: digest-key}}
+            - {name: MOBILE_USE_HTTP_CERT, value: /run/http/tls.crt}
+            - {name: MOBILE_USE_HTTP_KEY, value: /run/http/tls.key}
+            - {name: MOBILE_USE_RELAY_CERT, value: /run/relay/tls.crt}
+            - {name: MOBILE_USE_RELAY_KEY, value: /run/relay/tls.key}
+            - {name: MOBILE_USE_RELAY_CA, value: /run/relay/ca.crt}
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              port: https
+              path: /readyz
+              httpHeaders: [{name: Host, value: localhost}]
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              port: https
+              path: /healthz
+              httpHeaders: [{name: Host, value: localhost}]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: http-tls, mountPath: /run/http, readOnly: true}
+            - {name: relay-tls, mountPath: /run/relay, readOnly: true}
+      volumes:
+        - name: http-tls
+          secret: {secretName: {{ .Values.httpTLSSecret }}, defaultMode: 0440}
+        - name: relay-tls
+          secret: {secretName: {{ .Values.relayTLSSecret }}, defaultMode: 0440}

@@ -1,0 +1,8 @@
+.git
+android
+data
+bin
+**/node_modules
+internal/webui/dist/assets
+.env
+**/*.key

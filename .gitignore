@@ -1,0 +1,14 @@
+/bin/
+/data/
+/web/node_modules/
+/web/dist/
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep
+**/.gradle/
+**/build/
+**/local.properties
+**/__pycache__/
+*.sqlite*
+*.key
+*.p12
+.env

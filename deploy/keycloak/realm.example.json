@@ -1,0 +1,48 @@
+{
+  "realm": "mobile-use",
+  "enabled": true,
+  "sslRequired": "all",
+  "registrationAllowed": false,
+  "clientScopes": [
+    {
+      "name": "mobile-use",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "true" },
+      "protocolMappers": [
+        {
+          "name": "device API audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "https://mobile-use.example.internal/mcp", "access.token.claim": "true", "id.token.claim": "false" }
+        },
+        {
+          "name": "workspace membership",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": { "user.attribute": "mobile_use_workspace", "claim.name": "mobile_use_workspace", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "false" }
+        },
+        {
+          "name": "mobile-use role",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": { "user.attribute": "mobile_use_role", "claim.name": "mobile_use_role", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "false" }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "mobile-use-console",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["https://mobile-use.example.internal/auth/callback"],
+      "webOrigins": ["https://mobile-use.example.internal"],
+      "defaultClientScopes": ["mobile-use"],
+      "attributes": { "pkce.code.challenge.method": "S256" }
+    }
+  ]
+}

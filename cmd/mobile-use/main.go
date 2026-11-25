@@ -2,31 +2,18 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
-	"log/slog"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"mobile-use/internal/agent"
 	"mobile-use/internal/client"
-	"mobile-use/internal/connector"
-	"mobile-use/internal/relay"
-	"mobile-use/internal/service"
-	"mobile-use/internal/store"
-	"mobile-use/internal/webui"
 	"mobile-use/internal/wire"
 )
 
@@ -42,20 +29,8 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
-		fmt.Println(`mobile-use
-
-  mobile-use init                       Create local owner and agent credentials
-  mobile-use serve                      Run the local daemon and console
-  mobile-use serve --help               Show server and self-hosting options
-  mobile-use connector --help           Run a remote device connector
-  mobile-use mcp                        Serve MCP over stdio
-  mobile-use token admin|agent          Print a local credential
-  mobile-use devices                    List devices as the selected API identity
-  mobile-use call METHOD /v1/path [FILE]  Call the API with optional JSON from FILE or -
-  mobile-use doctor                     Check local Android availability
-  mobile-use pki --help                 Create a private CA or issue a certificate
-  mobile-use version                     Print build version`)
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printHelp()
 		return nil
 	}
 	switch args[0] {
@@ -64,17 +39,35 @@ func run(ctx context.Context, args []string) error {
 	case "version":
 		fmt.Println(version)
 		return nil
+	case "up":
+		return serve(ctx, args[1:], true)
 	case "serve":
-		return serve(ctx, args[1:])
+		return serve(ctx, args[1:], false)
 	case "connector":
 		return connect(ctx, args[1:])
+	case "ui", "console":
+		return cmdUI(ctx, args[1:])
+	case "pair":
+		return cmdPair(ctx, args[1:])
+	case "wifi":
+		return cmdWifi(ctx, args[1:])
+	case "devices":
+		return cmdDevices(ctx, args[1:])
+	case "enroll":
+		return cmdEnroll(ctx, args[1:])
+	case "sessions":
+		return cmdSessions(ctx, args[1:])
 	case "mcp":
 		api, err := newClient(false)
 		if err != nil {
 			return err
 		}
 		return agent.New(agent.Remote{Client: api}).Run(ctx, &mcp.StdioTransport{})
-	case "call", "devices":
+	case "mcp-config":
+		return cmdMCPConfig(args[1:])
+	case "remote":
+		return cmdRemote(args[1:])
+	case "call":
 		return call(ctx, args)
 	case "token":
 		if len(args) != 2 || args[1] != "admin" && args[1] != "agent" {
@@ -91,14 +84,7 @@ func run(ctx context.Context, args []string) error {
 		}
 		return nil
 	case "doctor":
-		probe, stop := context.WithTimeout(ctx, 6*time.Second)
-		defer stop()
-		devices, err := (connector.Android{ADB: os.Getenv("MOBILE_USE_ADB")}).Discover(probe)
-		result := map[string]any{"adb_available": err == nil, "authorized_android_devices": len(devices), "version": version}
-		if err != nil {
-			result["adb_error"] = err.Error()
-		}
-		return json.NewEncoder(os.Stdout).Encode(result)
+		return cmdDoctor(ctx, args[1:])
 	case "pki":
 		return pki(args[1:])
 	default:
@@ -106,10 +92,45 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
+func printHelp() {
+	fmt.Println(`mobile-use - control Android phones and iPhones from agents or the desktop console
+
+Quick start:
+  mobile-use up                         Initialize, start the daemon with Wi-Fi pairing, and open the console
+  mobile-use ui                         Open the desktop web console in your browser
+  mobile-use pair                       Display a QR code and pairing code for the Android companion
+  mobile-use wifi scan|pair|connect     Pair and connect Android phones over Wi-Fi (Wireless Debugging)
+
+Devices & sessions:
+  mobile-use devices                    List available devices (table on terminal, JSON when piped)
+  mobile-use enroll <DEVICE_ID>         Enroll, configure grants, or revoke a device
+  mobile-use sessions                   List or approve/deny/end device sessions
+
+Agents & MCP:
+  mobile-use mcp                        Serve MCP over stdio (for Codex, Claude Code, Cursor, etc.)
+  mobile-use mcp-config                 Print ready-to-paste Codex, Claude, and Cursor MCP commands
+  mobile-use remote set|show|clear      Configure a remote HTTPS mobile-use server
+
+Administration:
+  mobile-use init                       Create local owner and agent credentials
+  mobile-use serve [--help]             Run the local daemon or self-hosted server
+  mobile-use connector --help           Run a remote mTLS device connector
+  mobile-use token admin|agent          Print a local credential
+  mobile-use doctor                     Check ADB, Wi-Fi pairing, and daemon readiness
+  mobile-use call METHOD /v1/path [IN]  Call the HTTP API directly
+  mobile-use pki --help                 Create a private CA or issue mTLS certificates
+  mobile-use version                    Print build version`)
+}
+
 type config struct {
 	AdminToken string `json:"admin_token"`
 	AgentToken string `json:"agent_token"`
 	DigestKey  string `json:"digest_key"`
+}
+
+type remoteProfile struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
 }
 
 func configDir() (string, error) {
@@ -123,22 +144,44 @@ func configDir() (string, error) {
 	return filepath.Join(dir, "mobile-use"), nil
 }
 
-func initialize() error {
+func ensureConfig() (config, string, bool, error) {
 	dir, err := configDir()
+	if err != nil {
+		return config{}, "", false, err
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return config{}, "", false, err
+	}
+	path := filepath.Join(dir, "config.json")
+	if existing, err := readConfig(); err == nil {
+		return existing, path, false, nil
+	} else if !errors.Is(err, errNotInitialized) {
+		return config{}, path, false, err
+	}
+	value := config{AdminToken: wire.NewID() + wire.NewID(), AgentToken: wire.NewID() + wire.NewID(), DigestKey: wire.NewID() + wire.NewID()}
+	if err := writeNew(path, []byte(wire.Marshal(value)), 0600); err != nil {
+		if existing, rerr := readConfig(); rerr == nil {
+			return existing, path, false, nil
+		}
+		return config{}, path, false, err
+	}
+	return value, path, true, nil
+}
+
+func initialize() error {
+	_, path, created, err := ensureConfig()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+	if created {
+		fmt.Println("Created credentials in", path)
+	} else {
+		fmt.Println("Credentials already exist in", path)
 	}
-	path := filepath.Join(dir, "config.json")
-	value := config{AdminToken: wire.NewID() + wire.NewID(), AgentToken: wire.NewID() + wire.NewID(), DigestKey: wire.NewID() + wire.NewID()}
-	if err := writeNew(path, []byte(wire.Marshal(value)), 0600); err != nil {
-		return err
-	}
-	fmt.Println("Created credentials in", path)
 	return nil
 }
+
+var errNotInitialized = errors.New("run mobile-use init or mobile-use up, or configure a remote server with mobile-use remote set")
 
 func readConfig() (config, error) {
 	var value config
@@ -148,7 +191,7 @@ func readConfig() (config, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if errors.Is(err, os.ErrNotExist) {
-		return value, fmt.Errorf("run mobile-use init or configure a remote server and token")
+		return value, errNotInitialized
 	}
 	if err != nil {
 		return value, err
@@ -160,6 +203,28 @@ func readConfig() (config, error) {
 		return value, fmt.Errorf("invalid local configuration")
 	}
 	return value, nil
+}
+
+func readRemote() (remoteProfile, bool, error) {
+	var profile remoteProfile
+	dir, err := configDir()
+	if err != nil {
+		return profile, false, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "remote.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return profile, false, nil
+	}
+	if err != nil {
+		return profile, false, err
+	}
+	if err := json.Unmarshal(data, &profile); err != nil {
+		return profile, false, err
+	}
+	if profile.URL == "" || profile.Token == "" {
+		return profile, false, nil
+	}
+	return profile, true, nil
 }
 
 func writeNew(path string, data []byte, perms os.FileMode) error {
@@ -181,384 +246,48 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-type backendFlags struct {
-	adb            *string
-	noAndroid      *bool
-	androidHelper  *bool
-	scrcpyServer   *string
-	iosFFmpeg      *string
-	androidCatalog *string
-	aapt2          *string
-	appium         *string
-	ios            *string
-}
-
-func platformFlags(f *flag.FlagSet) backendFlags {
-	return backendFlags{
-		adb:            f.String("adb", env("MOBILE_USE_ADB", "adb"), "Path to the Android platform-tools adb executable"),
-		noAndroid:      f.Bool("no-android", false, "Disable local Android discovery"),
-		androidHelper:  f.Bool("android-control-helper", env("MOBILE_USE_ANDROID_CONTROL_HELPER", "") == "1", "Use the trusted mobile-use instrumentation APK for Unicode and multi-touch"),
-		scrcpyServer:   f.String("scrcpy-server", os.Getenv("MOBILE_USE_SCRCPY_SERVER"), "Verified scrcpy 4.0 server file for Android live video"),
-		iosFFmpeg:      f.String("ios-ffmpeg", env("MOBILE_USE_IOS_FFMPEG", "ffmpeg"), "FFmpeg executable for the iOS MJPEG video tier"),
-		androidCatalog: f.String("android-catalog", os.Getenv("MOBILE_USE_ANDROID_CATALOG"), "Connector-managed Android deployment and reset catalog"),
-		aapt2:          f.String("aapt2", env("MOBILE_USE_AAPT2", "aapt2"), "Android Build Tools aapt2 executable for catalog APK checks"),
-		appium:         f.String("appium", env("MOBILE_USE_APPIUM", ""), "Loopback URL of an isolated Appium instance"),
-		ios:            f.String("ios-config", env("MOBILE_USE_IOS_CONFIG", ""), "JSON file with the allowed iOS devices and WDA settings"),
+func activeOrigin() string {
+	if value := os.Getenv("MOBILE_USE_URL"); value != "" {
+		return strings.TrimRight(value, "/")
 	}
-}
-
-func (b backendFlags) backends() ([]connector.Backend, error) {
-	var backends []connector.Backend
-	if !*b.noAndroid {
-		if *b.scrcpyServer != "" {
-			if err := connector.VerifyScrcpy(*b.scrcpyServer); err != nil {
-				return nil, err
-			}
-		}
-		var catalog *connector.AndroidCatalog
-		if *b.androidCatalog != "" {
-			var err error
-			catalog, err = connector.LoadAndroidCatalog(*b.androidCatalog, *b.aapt2)
-			if err != nil {
-				return nil, err
-			}
-		}
-		backends = append(backends, connector.Android{ADB: *b.adb, UseHelper: *b.androidHelper, ScrcpyServer: *b.scrcpyServer, Catalog: catalog})
+	if remote, ok, err := readRemote(); err == nil && ok {
+		return strings.TrimRight(remote.URL, "/")
 	}
-	if *b.appium != "" || *b.ios != "" {
-		data, err := os.ReadFile(*b.ios)
-		if err != nil {
-			return nil, err
-		}
-		var devices []connector.IOSDevice
-		if err := json.Unmarshal(data, &devices); err != nil {
-			return nil, err
-		}
-		ios, err := connector.NewIOS(*b.appium, devices, *b.iosFFmpeg)
-		if err != nil {
-			return nil, err
-		}
-		backends = append(backends, ios)
-	}
-	return backends, nil
-}
-
-func serve(parent context.Context, args []string) error {
-	f := flag.NewFlagSet("serve", flag.ContinueOnError)
-	listen := f.String("listen", env("MOBILE_USE_LISTEN", "127.0.0.1:8787"), "Console and agent API listen address")
-	origin := f.String("origin", env("MOBILE_USE_ORIGIN", "http://127.0.0.1:8787"), "Exact public HTTP origin including its port")
-	postgres := f.String("postgres", os.Getenv("MOBILE_USE_POSTGRES"), "PostgreSQL connection string; enables self-hosted mode")
-	issuer := f.String("oidc-issuer", os.Getenv("MOBILE_USE_OIDC_ISSUER"), "Trusted HTTPS OAuth issuer")
-	audience := f.String("oidc-audience", os.Getenv("MOBILE_USE_OIDC_AUDIENCE"), "Required API access token audience")
-	consoleClient := f.String("oidc-console-client", os.Getenv("MOBILE_USE_CONSOLE_CLIENT"), "Pre-registered public OAuth client for the console")
-	httpCert := f.String("http-cert", os.Getenv("MOBILE_USE_HTTP_CERT"), "HTTPS certificate")
-	httpKey := f.String("http-key", os.Getenv("MOBILE_USE_HTTP_KEY"), "HTTPS private key")
-	relayListen := f.String("relay-listen", os.Getenv("MOBILE_USE_RELAY_LISTEN"), "mTLS connector listener")
-	relayAddress := f.String("relay-address", os.Getenv("MOBILE_USE_RELAY_ADDRESS"), "Per-replica peer address in host:port form")
-	relayCert := f.String("relay-cert", os.Getenv("MOBILE_USE_RELAY_CERT"), "Connector relay TLS certificate")
-	relayKey := f.String("relay-key", os.Getenv("MOBILE_USE_RELAY_KEY"), "Connector relay TLS private key")
-	relayCA := f.String("relay-ca", os.Getenv("MOBILE_USE_RELAY_CA"), "Private CA for connectors and relay peers")
-	companionListen := f.String("companion-listen", os.Getenv("MOBILE_USE_COMPANION_LISTEN"), "Optional LAN-only companion TLS listener in workstation mode")
-	companionOrigin := f.String("companion-origin", os.Getenv("MOBILE_USE_COMPANION_ORIGIN"), "HTTPS origin reached by Android companion")
-	companionCert := f.String("companion-cert", os.Getenv("MOBILE_USE_COMPANION_CERT"), "Companion HTTPS certificate")
-	companionKey := f.String("companion-key", os.Getenv("MOBILE_USE_COMPANION_KEY"), "Companion HTTPS key")
-	connectorMap := f.String("connectors", os.Getenv("MOBILE_USE_CONNECTORS"), "Approved connector common names as name=workspace pairs")
-	peerNames := f.String("relay-peers", os.Getenv("MOBILE_USE_RELAY_PEERS"), "Comma-separated common names of trusted replica clients")
-	platforms := platformFlags(f)
-	if err := f.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-	if f.NArg() != 0 {
-		return fmt.Errorf("unexpected daemon arguments")
-	}
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
-	host, _, err := net.SplitHostPort(*listen)
-	if err != nil {
-		return fmt.Errorf("listen address must be host:port")
-	}
-	u, err := url.Parse(*origin)
-	if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("origin must be a bare HTTP or HTTPS origin")
-	}
-	if u.Scheme == "https" && (*httpCert == "" || *httpKey == "") {
-		return fmt.Errorf("HTTPS origin requires --http-cert and --http-key")
-	}
-	if u.Scheme == "http" && !loopback(host) {
-		return fmt.Errorf("an HTTP listener must be loopback-only")
-	}
-	var cfg config
-	var sqlitePath string
-	var principals []service.Principal
-	if *postgres == "" {
-		if !loopback(host) || !loopback(u.Hostname()) {
-			return fmt.Errorf("workstation mode is loopback-only")
-		}
-		cfg, err = readConfig()
-		if err != nil {
-			return err
-		}
-		dir, err := configDir()
-		if err != nil {
-			return err
-		}
-		sqlitePath = filepath.Join(dir, "mobile-use.sqlite")
-		principals = []service.Principal{{Token: cfg.AdminToken, Actor: wire.Actor{Workspace: "local", Subject: "local-owner", Role: wire.Admin}}, {Token: cfg.AgentToken, Actor: wire.Actor{Workspace: "local", Subject: "local-agent", Role: wire.Agent}}}
-	} else {
-		if *issuer == "" || u.Scheme != "https" {
-			return fmt.Errorf("self-hosting requires HTTPS and a trusted OIDC issuer")
-		}
-		cfg.DigestKey = os.Getenv("MOBILE_USE_DIGEST_KEY")
-	}
-	key, err := hex.DecodeString(cfg.DigestKey)
-	if err != nil || len(key) < 32 {
-		return fmt.Errorf("configure a shared 32-byte hexadecimal operation digest key")
-	}
-	startup, stop := context.WithTimeout(ctx, 15*time.Second)
-	defer stop()
-	auth, err := service.NewAuth(startup, *issuer, *audience, *consoleClient, principals)
-	if err != nil {
-		return err
-	}
-	db, err := store.Open(startup, sqlitePath, *postgres)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	hub := &relay.Hub{Store: db, RelayAddress: *relayAddress, PeerNames: make(map[string]bool)}
-	if *postgres == "" {
-		backends, err := platforms.backends()
-		if err != nil {
-			return err
-		}
-		hub.LocalWorkspace = "local"
-		hub.Local = connector.New("local", "local", backends...)
-		defer hub.Local.Disconnect()
-		go localInventory(ctx, db, hub.Local)
-	}
-	failures := make(chan error, 3)
-	if *relayListen != "" {
-		hub.ConnectorNames, err = parseConnectorMap(*connectorMap)
-		if err != nil {
-			return err
-		}
-		for _, name := range strings.Split(*peerNames, ",") {
-			if name == "" {
-				continue
-			}
-			if !wire.ValidID(name) || hub.ConnectorNames[name] != "" {
-				return fmt.Errorf("invalid or conflicting relay peer identity")
-			}
-			hub.PeerNames[name] = true
-		}
-		tlsConfig, err := relay.TLS(*relayCert, *relayKey, *relayCA, "", true)
-		if err != nil {
-			return err
-		}
-		if *relayAddress != "" {
-			if _, _, err := net.SplitHostPort(*relayAddress); err != nil {
-				return fmt.Errorf("relay address must be host:port")
-			}
-			hub.PeerTLS, err = relay.TLS(*relayCert, *relayKey, *relayCA, "", false)
-			if err != nil {
-				return err
-			}
-		}
-		go func() { failures <- hub.Serve(ctx, *relayListen, tlsConfig) }()
-	}
-	svc := &service.Service{Store: db, Hub: hub, DigestKey: key}
-	video, err := service.NewVideo(ctx, db, hub, os.Getenv("MOBILE_USE_TURN_URLS"), []byte(os.Getenv("MOBILE_USE_TURN_SECRET")), os.Getenv("MOBILE_USE_TURN_RELAY_ONLY") == "1")
-	if err != nil {
-		return err
-	}
-	svc.Video = video
-	go svc.Maintain(ctx)
-	var companionServer *http.Server
-	var extra func(*http.ServeMux)
-	if os.Getenv("MOBILE_USE_COMPANION_DISABLED") != "1" && (*companionOrigin != "" || *postgres != "") {
-		phoneOrigin := *companionOrigin
-		if phoneOrigin == "" {
-			phoneOrigin = *origin
-		}
-		phoneURL, err := url.Parse(phoneOrigin)
-		if err != nil || phoneURL.Scheme != "https" || phoneURL.Host == "" || phoneURL.Path != "" || phoneURL.User != nil || phoneURL.Fragment != "" || phoneURL.RawQuery != "" {
-			return fmt.Errorf("companion origin must be a bare HTTPS origin")
-		}
-		companion := service.NewCompanion(db, phoneOrigin)
-		hub.Companion = companion
-		go companion.Maintain(ctx)
-		extra = func(router *http.ServeMux) {
-			companion.ConsoleRoutes(router, auth, *origin)
-			if phoneOrigin == *origin && *companionListen == "" {
-				companion.PhoneRoutes(router)
-			}
-		}
-		if phoneOrigin != *origin || *companionListen != "" {
-			if *companionListen == "" || *companionCert == "" || *companionKey == "" {
-				return fmt.Errorf("a separate companion origin requires a TLS listener, certificate, and key")
-			}
-			companionServer = &http.Server{Addr: *companionListen, Handler: companion.PhoneHandler(), ReadHeaderTimeout: 4 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 25 * time.Second, MaxHeaderBytes: 8 << 10}
-			go func() { failures <- companionServer.ListenAndServeTLS(*companionCert, *companionKey) }()
-		}
-	}
-	handler := svc.HTTP(service.HTTPOptions{Origin: *origin, Auth: auth, Console: webui.Handler(), MCP: agent.HTTP(svc), Extra: extra, Video: video})
-	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 25 * time.Second, IdleTimeout: 45 * time.Second, MaxHeaderBytes: 32 << 10}
-	go func() {
-		if u.Scheme == "https" {
-			failures <- server.ListenAndServeTLS(*httpCert, *httpKey)
-		} else {
-			failures <- server.ListenAndServe()
-		}
-	}()
-	slog.Info("mobile-use listening", "origin", *origin, "version", version)
-	var failure error
-	select {
-	case <-ctx.Done():
-	case failure = <-failures:
-	}
-	cancel()
-	shutdown, done := context.WithTimeout(context.Background(), 3*time.Second)
-	defer done()
-	_ = server.Shutdown(shutdown)
-	if companionServer != nil {
-		_ = companionServer.Shutdown(shutdown)
-	}
-	if errors.Is(failure, http.ErrServerClosed) {
-		return nil
-	}
-	return failure
-}
-
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-func parseConnectorMap(raw string) (map[string]string, error) {
-	result := make(map[string]string)
-	for _, value := range strings.Split(raw, ",") {
-		if value == "" {
-			continue
-		}
-		name, space, ok := strings.Cut(value, "=")
-		if !ok || !wire.ValidID(name) || !wire.ValidID(space) || name == "local" || result[name] != "" {
-			return nil, fmt.Errorf("invalid connector allowlist")
-		}
-		result[name] = space
-	}
-	return result, nil
-}
-
-func localInventory(ctx context.Context, db *store.Store, manager *connector.Manager) {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	for {
-		discover, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
-		inventory := manager.Inventory(discover)
-		cancel()
-		if err := db.Register(ctx, "local", "local", inventory, time.Now()); err != nil && ctx.Err() == nil {
-			slog.Warn("Could not refresh local devices", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func connect(ctx context.Context, args []string) error {
-	f := flag.NewFlagSet("connector", flag.ContinueOnError)
-	address := f.String("endpoint", os.Getenv("MOBILE_USE_CONNECTOR_ENDPOINT"), "Remote mTLS relay address in host:port form")
-	name := f.String("name", os.Getenv("MOBILE_USE_CONNECTOR_NAME"), "Enrolled connector identity (certificate common name)")
-	space := f.String("workspace", os.Getenv("MOBILE_USE_CONNECTOR_WORKSPACE"), "Workspace used to derive stable device IDs")
-	cert := f.String("cert", os.Getenv("MOBILE_USE_CONNECTOR_CERT"), "Client certificate")
-	key := f.String("key", os.Getenv("MOBILE_USE_CONNECTOR_KEY"), "Client private key")
-	ca := f.String("ca", os.Getenv("MOBILE_USE_CONNECTOR_CA"), "Server CA certificate")
-	platforms := platformFlags(f)
-	if err := f.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-	if f.NArg() != 0 || !wire.ValidID(*name) || !wire.ValidID(*space) || *name == "local" {
-		return fmt.Errorf("set a valid connector name and workspace")
-	}
-	config, err := relay.TLS(*cert, *key, *ca, "", false)
-	if err != nil {
-		return err
-	}
-	if config.Certificates[0].Leaf.Subject.CommonName != *name {
-		return fmt.Errorf("connector certificate common name must match --name")
-	}
-	backends, err := platforms.backends()
-	if err != nil {
-		return err
-	}
-	return relay.Connect(ctx, *address, config, connector.New(*space, *name, backends...))
+	return "http://127.0.0.1:8787"
 }
 
 func newClient(admin bool) (*client.Client, error) {
 	token := os.Getenv("MOBILE_USE_TOKEN")
-	if token == "" {
-		cfg, err := readConfig()
-		if err != nil {
-			return nil, err
+	origin := os.Getenv("MOBILE_USE_URL")
+	if token != "" {
+		if origin == "" {
+			origin = "http://127.0.0.1:8787"
 		}
-		token = cfg.AgentToken
-		if admin {
-			token = cfg.AdminToken
-		}
+		return client.New(origin, token)
 	}
-	return client.New(env("MOBILE_USE_URL", "http://127.0.0.1:8787"), token)
+	if origin == "" {
+		if remote, ok, err := readRemote(); err != nil {
+			return nil, err
+		} else if ok {
+			return client.New(remote.URL, remote.Token)
+		}
+		origin = "http://127.0.0.1:8787"
+	}
+	cfg, err := readConfig()
+	if err != nil {
+		return nil, err
+	}
+	token = cfg.AgentToken
+	if admin {
+		token = cfg.AdminToken
+	}
+	return client.New(origin, token)
 }
 
-func call(ctx context.Context, args []string) error {
-	api, err := newClient(false)
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
 	if err != nil {
-		return err
+		return false
 	}
-	method, path := "GET", "/v1/devices"
-	var body json.RawMessage
-	if args[0] == "call" {
-		if len(args) < 3 || len(args) > 4 {
-			return fmt.Errorf("usage: mobile-use call METHOD /v1/path [FILE|-]")
-		}
-		method, path = args[1], args[2]
-		if len(args) == 4 {
-			var reader io.Reader = os.Stdin
-			if args[3] != "-" {
-				file, err := os.Open(args[3])
-				if err != nil {
-					return err
-				}
-				defer file.Close()
-				reader = file
-			}
-			body, err = io.ReadAll(io.LimitReader(reader, (128<<10)+1))
-			if err != nil {
-				return err
-			}
-			if len(body) > 128<<10 || !json.Valid(body) {
-				return fmt.Errorf("invalid or oversized JSON request")
-			}
-		}
-	}
-	var input any
-	if body != nil {
-		input = body
-	}
-	var output json.RawMessage
-	if err := api.Request(ctx, method, path, input, &output); err != nil {
-		return err
-	}
-	fmt.Print(string(output))
-	return nil
+	return (info.Mode() & os.ModeCharDevice) != 0
 }

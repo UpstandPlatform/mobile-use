@@ -114,6 +114,72 @@ paths:
       operationId: auditList
       responses:
         '200': {description: Recent workspace audit metadata}
+  /v1/system/info:
+    get:
+      operationId: systemInfo
+      responses:
+        '200': {description: Daemon mode, companion endpoints, ADB readiness, and MCP commands}
+  /v1/companion/pairing:
+    post:
+      operationId: createCompanionPairing
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin: {type: string, format: uri}
+                auto_enroll: {type: boolean}
+                grant_agents: {type: array, items: {type: string}}
+      responses:
+        '201': {description: Companion pairing code, origin, fingerprint, and QR URI}
+  /v1/companion/pairing/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: companionPairingStatus
+      responses:
+        '200': {description: Current pairing status (waiting, paired, or expired)}
+  /v1/companion/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    delete:
+      operationId: revokeCompanion
+      responses:
+        '200': {description: Companion unpaired and revoked}
+  /v1/local/adb/discover:
+    get:
+      operationId: localAdbDiscover
+      responses:
+        '200': {description: Workstation ADB availability and mDNS wireless debugging services}
+  /v1/local/adb/pair:
+    post:
+      operationId: localAdbPair
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address, code]
+              properties:
+                address: {type: string}
+                code: {type: string}
+      responses:
+        '200': {description: Wireless debugging pairing result}
+  /v1/local/adb/connect:
+    post:
+      operationId: localAdbConnect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: {type: string}
+      responses:
+        '200': {description: Wireless debugging connection result}
 components:
   securitySchemes:
     bearer: {type: http, scheme: bearer}

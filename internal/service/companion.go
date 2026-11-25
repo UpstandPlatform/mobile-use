@@ -1,11 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,13 +22,44 @@ import (
 
 const sensorLifetime = 2 * time.Minute
 const artifactLifetime = 5 * time.Minute
+const pairingAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+type CompanionEndpoint struct {
+	Origin    string `json:"origin"`
+	Interface string `json:"interface,omitempty"`
+	Primary   bool   `json:"primary,omitempty"`
+}
 
 type Companion struct {
-	Store    *store.Store
-	Origin   string
+	Store           *store.Store
+	Origin          string
+	Origins         []CompanionEndpoint
+	AllowedOrigins  []string
+	CertFingerprint string
+	Mode            string
+	HostName        string
+
 	mu       sync.Mutex
 	frames   map[string]phoneFrame
 	requests map[string]sensorEntry
+	pairings map[string]*pairingRecord
+	byCode   map[string]string
+	attempts map[string][]time.Time
+}
+
+type pairingRecord struct {
+	ID           string
+	Workspace    string
+	Owner        string
+	Creator      wire.Actor
+	CodeHash     string
+	ExpiresAt    time.Time
+	AutoEnroll   bool
+	GrantAgents  []string
+	State        string
+	DeviceID     string
+	Label        string
+	AutoEnrolled bool
 }
 
 type phoneFrame struct {
@@ -38,7 +74,18 @@ type sensorEntry struct {
 }
 
 func NewCompanion(db *store.Store, origin string) *Companion {
-	return &Companion{Store: db, Origin: origin, frames: make(map[string]phoneFrame), requests: make(map[string]sensorEntry)}
+	return &Companion{
+		Store:          db,
+		Origin:         origin,
+		Origins:        []CompanionEndpoint{{Origin: origin, Primary: true}},
+		AllowedOrigins: []string{origin},
+		Mode:           "remote",
+		frames:         make(map[string]phoneFrame),
+		requests:       make(map[string]sensorEntry),
+		pairings:       make(map[string]*pairingRecord),
+		byCode:         make(map[string]string),
+		attempts:       make(map[string][]time.Time),
+	}
 }
 
 func hashToken(token string) string {
@@ -46,15 +93,193 @@ func hashToken(token string) string {
 	return hex.EncodeToString(data[:])
 }
 
+func generatePairingCode() string {
+	var raw [8]byte
+	_, _ = rand.Read(raw[:])
+	var out [8]byte
+	for i := range out {
+		out[i] = pairingAlphabet[int(raw[i])&31]
+	}
+	return string(out[:4]) + "-" + string(out[4:])
+}
+
+// NormalizePairingCode validates and canonicalizes an 8-character pairing code or legacy 32-char hex code.
+func NormalizePairingCode(raw string) (string, bool) {
+	clean := strings.TrimSpace(raw)
+	clean = strings.ReplaceAll(clean, "-", "")
+	clean = strings.ReplaceAll(clean, " ", "")
+	if len(clean) == 8 {
+		upper := strings.ToUpper(clean)
+		for i := 0; i < len(upper); i++ {
+			if !strings.ContainsRune(pairingAlphabet, rune(upper[i])) {
+				return "", false
+			}
+		}
+		return upper, true
+	}
+	if len(clean) == 32 {
+		lower := strings.ToLower(clean)
+		for i := 0; i < len(lower); i++ {
+			c := lower[i]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				return "", false
+			}
+		}
+		return lower, true
+	}
+	return "", false
+}
+
+// BuildPairingURI encodes a mobile-use://pair QR/deep-link payload.
+func BuildPairingURI(origin, code, fingerprint, hostName, mode string) string {
+	norm, ok := NormalizePairingCode(code)
+	if !ok {
+		norm = strings.TrimSpace(code)
+	}
+	q := url.Values{}
+	q.Set("o", origin)
+	q.Set("c", norm)
+	if hostName != "" {
+		q.Set("n", hostName)
+	}
+	if mode != "" {
+		q.Set("m", mode)
+	}
+	if fingerprint != "" {
+		q.Set("p", strings.ToLower(fingerprint))
+	}
+	return "mobile-use://pair?" + q.Encode()
+}
+
+func (c *Companion) selectOrigin(requested string) (string, bool) {
+	if strings.TrimSpace(requested) == "" {
+		return c.Origin, true
+	}
+	trimmed := strings.TrimRight(strings.TrimSpace(requested), "/")
+	for _, allowed := range c.AllowedOrigins {
+		if strings.EqualFold(trimmed, allowed) {
+			return allowed, true
+		}
+	}
+	for _, ep := range c.Origins {
+		if strings.EqualFold(trimmed, ep.Origin) {
+			return ep.Origin, true
+		}
+	}
+	if strings.EqualFold(trimmed, c.Origin) {
+		return c.Origin, true
+	}
+	return "", false
+}
+
 func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin string) {
 	router.Handle("POST /v1/companion/pairing", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
-		code := wire.NewID()
-		expiry := time.Now().Add(5 * time.Minute)
-		if err := c.Store.PairCompanion(r.Context(), actor, hashToken(code), expiry); err != nil {
+		var req struct {
+			Origin      string   `json:"origin"`
+			AutoEnroll  bool     `json:"auto_enroll"`
+			GrantAgents []string `json:"grant_agents"`
+		}
+		if r.Body != nil {
+			defer r.Body.Close()
+			raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<10))
+			if err != nil {
+				writeError(w, wire.Error("INVALID_JSON", "Send one valid JSON object for this operation.", 400))
+				return
+			}
+			if len(bytes.TrimSpace(raw)) > 0 {
+				dec := json.NewDecoder(bytes.NewReader(raw))
+				dec.DisallowUnknownFields()
+				if err := dec.Decode(&req); err != nil || dec.Decode(new(json.RawMessage)) != io.EOF {
+					writeError(w, wire.Error("INVALID_JSON", "Send one valid JSON object for this operation.", 400))
+					return
+				}
+			}
+		}
+		selectedOrigin, ok := c.selectOrigin(req.Origin)
+		if !ok {
+			writeError(w, wire.Error("INVALID_ORIGIN", "The requested pairing origin is not active on this server.", 400))
+			return
+		}
+		for _, subject := range req.GrantAgents {
+			if !wire.ValidID(subject) {
+				writeError(w, wire.Error("INVALID_GRANT", "Each grant agent identity must be valid.", 400))
+				return
+			}
+		}
+		formattedCode := generatePairingCode()
+		normalizedCode, _ := NormalizePairingCode(formattedCode)
+		codeHash := hashToken(normalizedCode)
+		now := time.Now()
+		expiry := now.Add(5 * time.Minute)
+		if err := c.Store.PairCompanion(r.Context(), actor, codeHash, expiry); err != nil {
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, 201, map[string]any{"code": code, "origin": c.Origin, "expires_at": expiry})
+		id := wire.NewID()
+		c.mu.Lock()
+		c.ensureMapsLocked()
+		c.sweepLocked(now)
+		c.pairings[id] = &pairingRecord{
+			ID:          id,
+			Workspace:   actor.Workspace,
+			Owner:       actor.Subject,
+			Creator:     actor,
+			CodeHash:    codeHash,
+			ExpiresAt:   expiry,
+			AutoEnroll:  req.AutoEnroll,
+			GrantAgents: req.GrantAgents,
+			State:       "waiting",
+		}
+		c.byCode[codeHash] = id
+		c.mu.Unlock()
+
+		mode := c.Mode
+		if mode == "" {
+			mode = "remote"
+		}
+		origins := c.Origins
+		if len(origins) == 0 && c.Origin != "" {
+			origins = []CompanionEndpoint{{Origin: c.Origin, Primary: true}}
+		}
+		writeJSON(w, 201, map[string]any{
+			"id":          id,
+			"code":        formattedCode,
+			"origin":      selectedOrigin,
+			"origins":     origins,
+			"fingerprint": c.CertFingerprint,
+			"mode":        mode,
+			"host_name":   c.HostName,
+			"qr_uri":      BuildPairingURI(selectedOrigin, formattedCode, c.CertFingerprint, c.HostName, mode),
+			"expires_at":  expiry,
+			"auto_enroll": req.AutoEnroll && actor.CanManage(),
+		})
+	}), origin))
+	router.Handle("GET /v1/companion/pairing/{id}", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+		id := r.PathValue("id")
+		now := time.Now()
+		c.mu.Lock()
+		c.ensureMapsLocked()
+		c.sweepLocked(now)
+		record, ok := c.pairings[id]
+		if !ok || record.Workspace != actor.Workspace || (!actor.CanManage() && actor.Subject != record.Owner) {
+			c.mu.Unlock()
+			writeError(w, wire.ErrNotFound)
+			return
+		}
+		state := record.State
+		if state == "waiting" && !now.Before(record.ExpiresAt) {
+			state = "expired"
+		}
+		resp := map[string]any{
+			"id":            record.ID,
+			"state":         state,
+			"device_id":     record.DeviceID,
+			"label":         record.Label,
+			"auto_enrolled": record.AutoEnrolled,
+			"expires_at":    record.ExpiresAt,
+		}
+		c.mu.Unlock()
+		writeJSON(w, 200, resp)
 	}), origin))
 	router.Handle("DELETE /v1/companion/{id}", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		id := r.PathValue("id")
@@ -67,8 +292,44 @@ func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin stri
 	}), origin))
 }
 
+func (c *Companion) allowEnrollAttempt(remoteAddr string, now time.Time) bool {
+	ip := remoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		ip = host
+	}
+	cutoff := now.Add(-time.Minute)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureMapsLocked()
+	total := 0
+	for k, list := range c.attempts {
+		kept := list[:0]
+		for _, ts := range list {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.attempts, k)
+		} else {
+			c.attempts[k] = kept
+			total += len(kept)
+		}
+	}
+	if total >= 60 || len(c.attempts[ip]) >= 15 || (len(c.attempts) >= 1000 && len(c.attempts[ip]) == 0) {
+		return false
+	}
+	c.attempts[ip] = append(c.attempts[ip], now)
+	return true
+}
+
 func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 	router.HandleFunc("POST /companion/enroll", func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
+		if !c.allowEnrollAttempt(r.RemoteAddr, now) {
+			writeError(w, wire.Error("RATE_LIMITED", "Too many pairing attempts. Wait a minute and try again.", 429))
+			return
+		}
 		var req struct {
 			Code  string `json:"code"`
 			Label string `json:"label"`
@@ -76,17 +337,85 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		if len(req.Code) != 32 || len(req.Label) < 1 || len(req.Label) > 80 {
+		normalizedCode, ok := NormalizePairingCode(req.Code)
+		if !ok || len(req.Label) < 1 || len(req.Label) > 80 {
 			writeError(w, wire.Error("INVALID_PAIRING", "Provide a valid pairing code and device name.", 400))
 			return
 		}
+		codeHash := hashToken(normalizedCode)
 		token := wire.NewID() + wire.NewID()
-		phone, err := c.Store.EnrollCompanion(r.Context(), hashToken(req.Code), hashToken(token), req.Label, time.Now())
+		phone, err := c.Store.EnrollCompanion(r.Context(), codeHash, hashToken(token), req.Label, now)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		writeJSON(w, 201, map[string]string{"token": token, "device_id": phone.ID})
+		caps := wire.Capabilities{wire.Screen: true, wire.Camera: true, wire.Microphone: true}
+		_ = c.Store.Register(r.Context(), phone.Workspace, phoneConnector(phone.ID), []wire.Inventory{{
+			ID:           phone.ID,
+			Label:        phone.Label,
+			Platform:     "android",
+			Mode:         "companion",
+			Capabilities: caps,
+		}}, now)
+
+		var autoEnroll bool
+		var creator wire.Actor
+		var grantAgents []string
+		var recordID string
+		c.mu.Lock()
+		c.ensureMapsLocked()
+		if id, exists := c.byCode[codeHash]; exists {
+			recordID = id
+			if rec := c.pairings[id]; rec != nil {
+				autoEnroll = rec.AutoEnroll
+				creator = rec.Creator
+				grantAgents = append([]string(nil), rec.GrantAgents...)
+				rec.State = "paired"
+				rec.DeviceID = phone.ID
+				rec.Label = phone.Label
+			}
+			delete(c.byCode, codeHash)
+		}
+		c.mu.Unlock()
+
+		autoEnrolled := false
+		if autoEnroll && creator.CanManage() {
+			subjects := grantAgents
+			if len(subjects) == 0 && phone.Workspace == "local" {
+				subjects = []string{"local-agent"}
+			}
+			var grants []wire.Grant
+			for _, subj := range subjects {
+				if wire.ValidID(subj) {
+					grants = append(grants, wire.Grant{
+						Subject:      subj,
+						Capabilities: []wire.Capability{wire.Screen, wire.Camera, wire.Microphone},
+					})
+				}
+			}
+			enabled := true
+			if _, _, err := c.Store.Enroll(r.Context(), creator, phone.ID, wire.Enrollment{
+				Label:   phone.Label,
+				Owner:   phone.Owner,
+				Profile: wire.Personal,
+				Grants:  grants,
+				Enabled: &enabled,
+			}, now); err == nil {
+				autoEnrolled = true
+			}
+		}
+		if recordID != "" && autoEnrolled {
+			c.mu.Lock()
+			if rec := c.pairings[recordID]; rec != nil {
+				rec.AutoEnrolled = true
+			}
+			c.mu.Unlock()
+		}
+		resp := map[string]any{"token": token, "device_id": phone.ID}
+		if autoEnrolled {
+			resp["auto_enrolled"] = true
+		}
+		writeJSON(w, 201, resp)
 	})
 	router.HandleFunc("POST /companion/heartbeat", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
 		var req struct {
@@ -176,7 +505,29 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 func (c *Companion) PhoneHandler() http.Handler {
 	router := http.NewServeMux()
 	c.PhoneRoutes(router)
-	return perimeter(router, c.Origin, "")
+	origins := c.AllowedOrigins
+	if len(origins) == 0 && c.Origin != "" {
+		origins = []string{c.Origin}
+	}
+	return perimeterHosts(router, origins, "")
+}
+
+func (c *Companion) ensureMapsLocked() {
+	if c.frames == nil {
+		c.frames = make(map[string]phoneFrame)
+	}
+	if c.requests == nil {
+		c.requests = make(map[string]sensorEntry)
+	}
+	if c.pairings == nil {
+		c.pairings = make(map[string]*pairingRecord)
+	}
+	if c.byCode == nil {
+		c.byCode = make(map[string]string)
+	}
+	if c.attempts == nil {
+		c.attempts = make(map[string][]time.Time)
+	}
 }
 
 func phoneConnector(id string) string { return "companion." + id }
@@ -414,6 +765,17 @@ func (c *Companion) sweepLocked(now time.Time) {
 	for id, entry := range c.requests {
 		if !now.Before(entry.status.ExpiresAt) {
 			delete(c.requests, id)
+		}
+	}
+	retention := now.Add(-15 * time.Minute)
+	for id, rec := range c.pairings {
+		if rec.State == "waiting" && !now.Before(rec.ExpiresAt) {
+			rec.State = "expired"
+			delete(c.byCode, rec.CodeHash)
+		}
+		if rec.ExpiresAt.Before(retention) {
+			delete(c.byCode, rec.CodeHash)
+			delete(c.pairings, id)
 		}
 	}
 }

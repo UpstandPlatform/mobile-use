@@ -23,53 +23,69 @@ flowchart LR
 | iPhone automation | macOS binary, Xcode, Appium XCUITest, and signed WebDriverAgent | Mac trust and iPhone Developer Mode |
 | Private remote control | Container or Helm chart, PostgreSQL, OIDC, and a device connector | Network access between the private service, agent, and connector |
 
-## Install the desktop binary
+## Install and start the desktop console
 
 Download your platform archive from [Releases](https://github.com/UpstandPlatform/mobile-use/releases). Use `amd64` for Intel and AMD PCs and `arm64` for Apple Silicon or other ARM64 systems. This private repository and its packages require GitHub project access. Compare the download to its entry in `SHA256SUMS` using `Get-FileHash -Algorithm SHA256 <archive>` on Windows, `shasum -a 256 <archive>` on macOS, or `sha256sum <archive>` on Linux.
 
-Extract the archive. From its folder, run the following commands. On Windows, substitute `.\mobile-use.exe` for `./mobile-use`.
+Extract the archive. From its folder, run `up` to initialize local credentials, start the workstation daemon with automatic local Wi-Fi companion TLS + mDNS, and open the desktop web console in your browser (Linux, macOS, or Windows). On Windows, substitute `.\mobile-use.exe` for `./mobile-use`.
 
 ```sh
-./mobile-use version
-./mobile-use init
-./mobile-use token admin
-./mobile-use serve
+./mobile-use up
 ```
 
-Open [the local console](http://127.0.0.1:8787) and paste the admin token. Keep the daemon running while using the console or an agent. The archive includes the console.
+Or run each step manually:
 
-### Control an Android phone
+```sh
+./mobile-use init
+./mobile-use serve
+./mobile-use ui
+```
+
+Keep the daemon running while using the console or an agent.
+
+### Control an Android phone (USB or Wi-Fi ADB)
 
 1. Install [Android SDK Platform Tools](https://developer.android.com/tools/releases/platform-tools) and add its directory to `PATH`.
-2. Enable Developer options on the phone. For USB, enable USB debugging, connect the cable, and approve the computer’s key. For Wireless Debugging, use `adb pair HOST:PAIRING_PORT` and then `adb connect HOST:DEBUG_PORT` with the addresses shown by Android.
-3. Run `adb devices -l` or `./mobile-use doctor`. In the console, select the phone and choose **Enroll this device**. Use a personal profile for a phone whose sessions require owner approval. Use a dedicated profile for unattended, policy-granted devices.
-4. Add `local-agent=screen,ui_tree,touch` in **Agent grants** to let the workstation agent inspect and tap. Grant additional capabilities as needed.
+2. Enable Developer options on the phone:
+   - **USB:** enable USB debugging, connect the cable, and approve the computer’s key.
+   - **Wi-Fi (same network):** enable **Wireless debugging**, then either open **Add device → Android Wi-Fi (ADB)** in the desktop console to scan and pair, or use the CLI:
+     ```sh
+     ./mobile-use wifi scan
+     ./mobile-use wifi pair HOST:PAIRING_PORT 123456
+     ./mobile-use wifi connect HOST:DEBUG_PORT
+     ```
+3. Run `./mobile-use devices` or `./mobile-use doctor`. In the console (or with `./mobile-use enroll <DEVICE_ID>`), enroll the phone. Use a personal profile for a phone whose sessions require owner approval. Use a dedicated profile for unattended, policy-granted devices.
+4. Click **+ Allow local-agent (MCP)** in the console’s **Agent grants** editor (or pass `--grant local-agent=...` to `enroll`) to let your workstation agent inspect and tap.
 
-For Unicode input and pinch, install `mobile-use-control-<version>.apk` with `adb install -r <apk>` and pass `--android-control-helper` to `serve` or `connector`. For WebRTC viewing, download `scrcpy-server-v4.0` from the [official scrcpy release](https://github.com/Genymobile/scrcpy/releases/tag/v4.0) and pass `--scrcpy-server /path/to/scrcpy-server-v4.0`. The connector verifies the server file before capture.
+For Unicode input and pinch, install `mobile-use-control-<version>.apk` with `adb install -r <apk>` and pass `--android-control-helper` to `serve`, `up`, or `connector`. For WebRTC viewing, download `scrcpy-server-v4.0` from the [official scrcpy release](https://github.com/Genymobile/scrcpy/releases/tag/v4.0) and pass `--scrcpy-server /path/to/scrcpy-server-v4.0`. The connector verifies the server file before capture.
 
-### Pair the Android companion
+### Pair the Android companion (QR code or Wi-Fi discovery)
 
 Download `mobile-use-companion-<version>.apk` on Android 14 or later. Open it in the phone’s Files app and, if Android prompts you, allow that app to install the package. Official builds use the [Android release certificate](deploy/android-release-certificate.pem).
 
-1. Provide an HTTPS endpoint the phone can reach with a certificate it trusts. For a workstation, set `--companion-listen`, `--companion-origin`, `--companion-cert`, and `--companion-key`. For example, bind `--companion-listen 0.0.0.0:8444` on a trusted LAN and use the HTTPS hostname and port the phone will reach as `--companion-origin`. The certificate must match that hostname.
-2. Choose **Pair Android** in the console, then enter the displayed address and code in the phone app before the code expires.
-3. Enroll the companion in the console. Keep the app available to review requests. Approve Android’s screen-sharing prompt and each camera or microphone request as needed.
-4. Use **Stop** in the app or console to end sharing. **Unpair phone** clears the phone’s credentials and revokes its server pairing when connected.
+1. **Workstation over Wi-Fi (zero-config):** `mobile-use up` (or `serve`) automatically provisions a pinned TLS certificate in your config directory, binds a LAN companion listener, and advertises your computer via mDNS (`_mobile-use._tcp`). Click **+ Add device → Companion (QR & Wi-Fi)** in the console or run `./mobile-use pair` to display a QR code and 8-character pairing code (`XXXX-XXXX`).
+2. **Pair from the phone:** Open the **mobile-use** app on Android and either:
+   - Tap **Scan QR code** and scan the QR code shown in the console or terminal, or
+   - Tap your computer under **Nearby on Wi-Fi**, verify the fingerprint, and enter the 8-character code.
+3. **Remote HTTPS servers:** Configure `--companion-origin` on the remote server and point your local CLI with `./mobile-use remote set --url https://... --token <TOKEN>`. Then scan the QR code or choose **Remote HTTPS** in the Android app.
+4. Keep the app available to review requests. Approve Android’s screen-sharing prompt and each camera or microphone request as needed. Use **Stop** in the app or console to end sharing, or **Unpair phone** / **Unpair companion** to revoke credentials.
 
-The companion supports these features without Android debugging. Touch, typing, and app control use the separate ADB enrollment.
+The companion supports screen sharing, camera stills, and microphone clips without Android debugging. Touch, typing, and app control use the separate ADB enrollment.
 
 ### Connect an iPhone
 
-Use a Mac with Xcode and a compatible Appium XCUITest driver. Provision signed WebDriverAgent, start Appium on loopback, and pass `--appium` and `--ios-config` to `serve` or `connector`. The [iPhone setup guide](docs/operations.md#iphone-connector) covers inventory and video. Physical device certification is tracked in the [verification status](docs/verification.md).
+Use a Mac with Xcode and a compatible Appium XCUITest driver. Provision signed WebDriverAgent, start Appium on loopback, and pass `--appium` and `--ios-config` to `serve`, `up`, or `connector`. The [iPhone setup guide](docs/operations.md#iphone-connector) covers inventory and video. Physical device certification is tracked in the [verification status](docs/verification.md).
 
-## Connect an agent
+## Connect an agent (Codex, Claude, Cursor)
 
-Register the absolute path to the desktop binary with the `mcp` argument. A workstation install reads its local agent token. To connect to another server, set `MOBILE_USE_URL` and `MOBILE_USE_TOKEN` in the MCP process environment. Use the agent credential for automation and keep the admin credential for the console.
+Open the **MCP & Agents** tab in the desktop console or run `./mobile-use mcp-config` to copy exact setup commands for your system:
 
 ```sh
 codex mcp add mobile-use -- /absolute/path/mobile-use mcp
 claude mcp add --transport stdio mobile-use -- /absolute/path/mobile-use mcp
 ```
+
+A workstation install reads its local agent token automatically. To connect the CLI and stdio MCP server to a remote server, run `./mobile-use remote set --url https://... --token <TOKEN>` (or set `MOBILE_USE_URL` and `MOBILE_USE_TOKEN`). Use the agent credential for automation and keep the admin credential for the console.
 
 A network client can use Streamable HTTP at the private `https://<host>/mcp` endpoint. A typical MCP workflow calls `devices_list`, `session_start`, `session_status`, `observe`, `act`, and `session_end`. Use a fresh `frame_id` for screen-relative input and a unique `operation_id` for each action. If an outcome is unknown, observe the phone before retrying.
 

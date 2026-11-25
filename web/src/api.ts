@@ -39,7 +39,67 @@ export type Observation = {
   partial?: string[];
 };
 export type Audit = { at: string; actor: string; event: string; device?: string; session?: string; code?: string };
-export type OIDC = { issuer: string; client_id: string; authorization_endpoint: string; token_endpoint: string; resource: string; companion_enabled: boolean };
+export type OIDC = { issuer: string; client_id: string; authorization_endpoint: string; token_endpoint: string; resource: string; companion_enabled: boolean; local_exchange?: boolean };
+export type CompanionEndpoint = { origin: string; interface?: string; primary?: boolean };
+export type SystemInfo = {
+  version?: string;
+  mode: 'workstation' | 'remote';
+  host_name?: string;
+  origin: string;
+  adb_available?: boolean;
+  adb_error?: string;
+  wireless_adb_supported?: boolean;
+  companion_enabled: boolean;
+  companion_mode?: 'lan' | 'remote';
+  companion_origin?: string;
+  companion_origins?: CompanionEndpoint[];
+  companion_fingerprint?: string;
+  companion_fingerprint_short?: string;
+  mdns_active?: boolean;
+  mcp_executable?: string;
+  mcp_commands?: { codex: string; claude: string; http: string };
+};
+export type PairingSession = {
+  id: string;
+  code: string;
+  origin: string;
+  origins?: CompanionEndpoint[];
+  fingerprint?: string;
+  mode?: 'lan' | 'remote';
+  host_name?: string;
+  qr_uri: string;
+  expires_at: string;
+  auto_enroll?: boolean;
+};
+export type PairingStatus = {
+  id: string;
+  state: 'waiting' | 'paired' | 'expired';
+  device_id?: string;
+  label?: string;
+  auto_enrolled?: boolean;
+  expires_at: string;
+};
+export type WirelessAdbService = { name: string; type: 'pairing' | 'connect'; address: string };
+export type WirelessAdbDiscovery = {
+  adb_available: boolean;
+  adb_error?: string;
+  wireless_services: WirelessAdbService[];
+  connected_count: number;
+};
+
+export async function exchangeLaunchTicket(ticket: string): Promise<string> {
+  const response = await fetch('/auth/local-exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket }),
+    redirect: 'error',
+  });
+  const value = await response.json();
+  if (!response.ok || typeof value.token !== 'string') {
+    throw new Error(value.error?.message || 'The desktop launch ticket could not be verified.');
+  }
+  return value.token;
+}
 
 export const labels: Record<string, string> = {
   screen: 'Screen', ui_tree: 'UI tree', touch: 'Touch', text: 'Text input', apps: 'Installed apps',

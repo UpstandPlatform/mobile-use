@@ -4,14 +4,20 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import java.net.URI
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import org.json.JSONObject
 
-data class Pairing(val origin: String, val token: String)
+data class Pairing(
+    val origin: String,
+    val token: String,
+    val certPin: String = "",
+    val hostName: String = "",
+    val mode: String = "remote",
+)
 
 class PairingStore(context: Context) {
     private val preferences = context.getSharedPreferences("pairing", Context.MODE_PRIVATE)
@@ -23,14 +29,32 @@ class PairingStore(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
         cipher.updateAAD(origin.toByteArray())
-        Pairing(origin, cipher.doFinal(sealed).toString(Charsets.UTF_8))
+        val plain = cipher.doFinal(sealed).toString(Charsets.UTF_8)
+        if (plain.startsWith("{")) {
+            val obj = JSONObject(plain)
+            Pairing(
+                origin = origin,
+                token = obj.getString("token"),
+                certPin = obj.optString("certPin", ""),
+                hostName = obj.optString("hostName", ""),
+                mode = obj.optString("mode", "remote"),
+            )
+        } else {
+            Pairing(origin, plain)
+        }
     }.getOrNull()
 
     fun save(pairing: Pairing) {
+        val payload = JSONObject()
+            .put("token", pairing.token)
+            .put("certPin", pairing.certPin)
+            .put("hostName", pairing.hostName)
+            .put("mode", pairing.mode)
+            .toString()
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         cipher.updateAAD(pairing.origin.toByteArray())
-        val sealed = cipher.doFinal(pairing.token.toByteArray())
+        val sealed = cipher.doFinal(payload.toByteArray())
         check(preferences.edit()
             .putString("origin", pairing.origin)
             .putString("token", Base64.encodeToString(sealed, Base64.NO_WRAP))
@@ -54,13 +78,4 @@ class PairingStore(context: Context) {
     }
 
     companion object { private const val KEY_ALIAS = "mobile-use-pairing" }
-}
-
-fun normalizedOrigin(value: String): String {
-    val origin = URI(value.trim().trimEnd('/'))
-    require(origin.scheme == "https" && origin.host != null && origin.userInfo == null &&
-        origin.rawPath.isNullOrEmpty() && origin.rawQuery == null && origin.rawFragment == null) {
-        "Enter the HTTPS server address shown in the console."
-    }
-    return origin.toASCIIString()
 }

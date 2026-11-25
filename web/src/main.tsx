@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode, PointerEvent } from 'react';
 import { createRoot } from 'react-dom/client';
-import { api, beginLogin, completeLogin, labels } from './api';
-import type { Actor, Audit, Device, Observation, OIDC, Session } from './api';
+import { api, beginLogin, completeLogin, exchangeLaunchTicket, labels } from './api';
+import type { Actor, Audit, Device, Grant, Observation, OIDC, Session, SystemInfo } from './api';
+import { AddDevicePanel } from './AddDevicePanel';
 import { LiveVideo } from './LiveVideo';
+import { McpSetup } from './McpSetup';
 import './styles.css';
 
-type Tab = 'Devices' | 'Sessions' | 'Audit';
+type Tab = 'Devices' | 'Sessions' | 'MCP & Agents' | 'Audit';
 const time = (date: string) => new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Something went wrong.';
 
@@ -22,6 +24,7 @@ function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem('mobile-use.token') || '');
   const [draftToken, setDraftToken] = useState('');
   const [oidc, setOIDC] = useState<OIDC>();
+  const [systemInfo, setSystemInfo] = useState<SystemInfo>();
   const [actor, setActor] = useState<Actor>();
   const [devices, setDevices] = useState<Device[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -31,7 +34,7 @@ function App() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [captureRevision, setCaptureRevision] = useState(0);
-  const [pairing, setPairing] = useState<{ code: string; origin: string; expires_at: string }>();
+  const [showAddDevice, setShowAddDevice] = useState(false);
 
   const signedIn = useCallback((value: string) => {
     sessionStorage.setItem('mobile-use.token', value);
@@ -40,15 +43,25 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const hash = location.hash;
+    const launchTicket = hash.startsWith('#launch=') ? hash.slice('#launch='.length) : '';
+    if (launchTicket) history.replaceState(null, '', '/');
+
     fetch('/auth/config').then(response => response.json()).then(async (value: OIDC) => {
       setOIDC(value);
-      if (location.pathname === '/auth/callback') signedIn(await completeLogin(value));
+      if (location.pathname === '/auth/callback') {
+        signedIn(await completeLogin(value));
+      } else if (launchTicket && value.local_exchange) {
+        signedIn(await exchangeLaunchTicket(launchTicket));
+      }
     }).catch(error => setError(errorText(error)));
   }, [signedIn]);
 
   const refresh = useCallback(async (credential: string, identity: Actor) => {
-    const nextDevices = await api<Device[]>(credential, '/v1/devices');
-    const nextSessions = await api<Session[]>(credential, '/v1/sessions');
+    const [nextDevices, nextSessions] = await Promise.all([
+      api<Device[]>(credential, '/v1/devices'),
+      api<Session[]>(credential, '/v1/sessions'),
+    ]);
     setDevices(nextDevices);
     setSessions(nextSessions);
     setSelected(current => nextDevices.some(device => device.id === current) ? current : nextDevices[0]?.id || '');
@@ -63,6 +76,9 @@ function App() {
     api<Actor>(token, '/v1/me').then(async identity => {
       if (ignore) return;
       setActor(identity);
+      api<SystemInfo>(token, '/v1/system/info').then(info => {
+        if (!ignore) setSystemInfo(info);
+      }).catch(() => undefined);
       await refresh(token, identity);
     }).catch(error => {
       if (!ignore) {
@@ -98,10 +114,11 @@ function App() {
     sessionStorage.removeItem('mobile-use.token');
     setToken('');
     setActor(undefined);
+    setSystemInfo(undefined);
     setDevices([]);
     setSessions([]);
     setAudits([]);
-    setPairing(undefined);
+    setShowAddDevice(false);
     setError('');
   }
 
@@ -116,43 +133,60 @@ function App() {
           <label htmlFor="credential">Access token</label>
           <input id="credential" type="password" autoComplete="off" required value={draftToken} onChange={event => setDraftToken(event.target.value)} />
           <button className="primary" type="submit">Open console</button>
-          <p className="hint">For a local installation, run <code>mobile-use token admin</code>.</p>
+          <p className="hint">For a local installation, run <code>mobile-use ui</code> or <code>mobile-use token admin</code>.</p>
         </form>}
     </div>
   </div>;
 
   const manage = ['admin', 'operator'].includes(actor.role);
+  const canAddDevice = manage || (actor.role === 'owner' && Boolean(oidc?.companion_enabled));
   const device = devices.find(item => item.id === selected);
   const deviceSessions = sessions.filter(item => item.device_id === selected);
   const active = deviceSessions.find(item => item.state === 'active');
-  const tabs: Tab[] = ['Devices', 'Sessions'];
+  const tabs: Tab[] = ['Devices', 'Sessions', 'MCP & Agents'];
   if (['admin', 'auditor'].includes(actor.role)) tabs.push('Audit');
   const change = (session: Session, verb: string) => run(() => api(token, `/v1/sessions/${session.id}/${verb}`, 'POST'));
 
   return <div className="layout">
     <header className="top">
       <a className="brand" href="/"> <PhoneMark small /> <span>mobile-use</span></a>
-      <nav aria-label="Workspace">{tabs.map(item => <button key={item} type="button" aria-current={item === tab ? 'page' : undefined} onClick={() => setTab(item)}>{item}</button>)}</nav>
+      <nav aria-label="Workspace">{tabs.map(item => <button key={item} type="button" aria-current={item === tab ? 'page' : undefined} onClick={() => setTab(item)}>
+        {item}{item === 'Sessions' && sessions.length > 0 ? <span className="nav-count">{sessions.length}</span> : null}
+      </button>)}</nav>
       <div className="identity"><span>{actor.workspace}</span><button type="button" onClick={signOut}>Sign out</button></div>
     </header>
     <main className="workspace">
       <div className="title-row"><h1>{tab}</h1>
-        <div className="actions">{oidc?.companion_enabled && tab === 'Devices' && (manage || actor.role === 'owner') && <button type="button" className="primary" onClick={() => run(async () => setPairing(await api(token, '/v1/companion/pairing', 'POST')))} disabled={busy}>Pair Android</button>}
-          <button type="button" onClick={() => run(() => refresh(token, actor))} disabled={busy}>Refresh</button></div>
+        <div className="actions">
+          {tab === 'Devices' && canAddDevice && (
+            <button type="button" className="primary" onClick={() => setShowAddDevice(v => !v)}>
+              {showAddDevice ? 'Hide add device' : '+ Add device'}
+            </button>
+          )}
+          <button type="button" onClick={() => run(() => refresh(token, actor))} disabled={busy}>Refresh</button>
+        </div>
       </div>
       {error && <div className="notice" role="alert"><span>{error}</span><button type="button" onClick={() => setError('')}>Dismiss</button></div>}
-      {pairing && tab === 'Devices' && <section className="surface pairing" aria-label="Pair an Android companion">
-        <div><h2>Pair an Android companion</h2><p>Open mobile-use on the phone and enter the server address and code before {time(pairing.expires_at)}.</p>
-          <dl><dt>Server address</dt><dd><code>{pairing.origin}</code></dd><dt>Pairing code</dt><dd><code>{pairing.code}</code></dd></dl></div>
-        <button type="button" onClick={() => setPairing(undefined)}>Close</button>
-      </section>}
+      {showAddDevice && tab === 'Devices' && (
+        <AddDevicePanel
+          token={token}
+          actor={actor}
+          systemInfo={systemInfo}
+          companionEnabled={Boolean(oidc?.companion_enabled)}
+          onClose={() => setShowAddDevice(false)}
+          onDeviceAdded={async deviceId => {
+            await refresh(token, actor);
+            if (deviceId) setSelected(deviceId);
+          }}
+        />
+      )}
       {tab === 'Devices' && <div className="device-layout">
         {devices.length > 1 && <label className="device-picker">Device<select value={selected} onChange={event => setSelected(event.target.value)}>
           {devices.map(item => <option key={item.id} value={item.id}>{item.label} · {item.online ? 'Online' : 'Offline'}</option>)}
         </select></label>}
         <section className={`surface inventory${devices.length ? ' inventory-populated' : ''}`} aria-label="Device inventory">
           <div className="section-heading"><h2>Inventory</h2><span>{devices.length} {devices.length === 1 ? 'device' : 'devices'}</span></div>
-          {devices.length === 0 ? <div className="empty"><PhoneMark /><h3>No devices available</h3><p>Connect an authorized phone or start an emulator on an enrolled connector.</p></div> : <ul className="device-list">{devices.map(item => <li key={item.id}>
+          {devices.length === 0 ? <div className="empty"><PhoneMark /><h3>No devices available</h3><p>Pair a phone over Wi-Fi, connect via USB/Wi-Fi ADB, or start an emulator.</p>{canAddDevice && !showAddDevice && <button type="button" className="primary" onClick={() => setShowAddDevice(true)}>+ Add device</button>}</div> : <ul className="device-list">{devices.map(item => <li key={item.id}>
             <button type="button" className={item.id === selected ? 'selected' : ''} onClick={() => setSelected(item.id)} aria-pressed={item.id === selected}>
               <PhoneMark small /><span><strong>{item.label}</strong><small>{item.platform === 'ios' ? 'iOS' : 'Android'} · {item.virtual ? 'Virtual device' : item.profile || 'Awaiting enrollment'}</small></span>
               <Badge tone={item.online ? 'green' : 'neutral'}>{item.online ? 'Online' : 'Offline'}</Badge>
@@ -163,16 +197,17 @@ function App() {
           <div className="section-heading"><div><h2>{device.label}</h2><span>{device.platform === 'ios' ? 'iOS' : 'Android'} · {device.connector || device.mode}</span></div><Badge tone={device.online ? 'green' : 'neutral'}>{device.online ? 'Online' : 'Offline'}</Badge></div>
           <div className="detail-body">
             {deviceSessions.length > 0 && <SessionList sessions={deviceSessions} devices={devices} actor={actor} busy={busy} change={change} selectedDevice={device.id} />}
-            {active && <Viewer key={`${active.id}:${active.controller}`} token={token} actor={actor} session={active} supportsVideo={device.live_video} captureRevision={captureRevision} onError={setError} />}
+            {active && <Viewer key={`${active.id}:${active.controller}`} token={token} actor={actor} session={active} supportsVideo={device.live_video} supportsNavKeys={device.mode !== 'companion'} captureRevision={captureRevision} onError={setError} />}
             {manage && active?.controller === actor.subject && device.profile === 'dedicated' && !!device.catalog?.length && active.capabilities.includes('apps') && active.capabilities.includes('touch') && !active.paused &&
               <MaintenanceForm key={active.id} device={device} token={token} session={active} onAttempt={() => setCaptureRevision(value => value + 1)} />}
             {device.enabled && device.online && !active && actor.role !== 'auditor' && <StartForm key={`start-${device.id}`} device={device} busy={busy} submit={body => run(() => api(token, '/v1/sessions', 'POST', body))} />}
-            {manage && <EnrollmentForm key={device.id} actor={actor} device={device} busy={busy} submit={body => run(() => api(token, `/v1/devices/${device.id}`, 'PUT', body))} />}
+            {manage && <EnrollmentForm key={device.id} actor={actor} device={device} busy={busy} submit={body => run(() => api(token, `/v1/devices/${device.id}`, 'PUT', body))} onUnpair={device.mode === 'companion' ? () => run(() => api(token, `/v1/companion/${device.id}`, 'DELETE')) : undefined} />}
             <details className="enrollment capability-list"><summary>Device capabilities</summary><p>{Object.keys(device.capabilities).filter(cap => device.capabilities[cap]).map(cap => labels[cap] || cap).join(' · ') || 'None available'}</p></details>
           </div>
         </section>}
       </div>}
-      {tab === 'Sessions' && <section className="surface detail"><SessionList sessions={sessions} devices={devices} actor={actor} busy={busy} change={change} /><div className="detail-body">{sessions.filter(item => item.state === 'active').map(item => <Viewer key={item.id} token={token} actor={actor} session={item} supportsVideo={devices.some(device => device.id === item.device_id && device.live_video)} onError={setError} />)}</div></section>}
+      {tab === 'Sessions' && <section className="surface detail"><SessionList sessions={sessions} devices={devices} actor={actor} busy={busy} change={change} /><div className="detail-body">{sessions.filter(item => item.state === 'active').map(item => <Viewer key={item.id} token={token} actor={actor} session={item} supportsVideo={devices.some(device => device.id === item.device_id && device.live_video)} supportsNavKeys={devices.some(device => device.id === item.device_id && device.mode !== 'companion')} onError={setError} />)}</div></section>}
+      {tab === 'MCP & Agents' && <McpSetup devices={devices} systemInfo={systemInfo} onSelectDevice={id => { setSelected(id); setTab('Devices'); }} />}
       {tab === 'Audit' && <section className="surface audit"><table><caption className="sr-only">Workspace audit events</caption><thead><tr><th>Time</th><th>Event</th><th>Identity</th><th>Result</th></tr></thead><tbody>{audits.map((item, index) => <tr key={`${item.at}-${index}`}><td>{new Date(item.at).toLocaleString()}</td><td>{item.event.replaceAll('_', ' ')}</td><td>{item.actor}</td><td>{item.code?.replaceAll('_', ' ') || '—'}</td></tr>)}</tbody></table>{audits.length === 0 && <p className="empty">No audit events yet.</p>}</section>}
     </main>
   </div>;
@@ -194,21 +229,41 @@ function SessionList({ sessions, devices, actor, busy, change, selectedDevice }:
   </li>)}</ul>;
 }
 
-function EnrollmentForm({ actor, device, busy, submit }: { actor: Actor; device: Device; busy: boolean; submit: (data: unknown) => void }) {
+function EnrollmentForm({ actor, device, busy, submit, onUnpair }: { actor: Actor; device: Device; busy: boolean; submit: (data: unknown) => void; onUnpair?: () => void }) {
   const [name, setName] = useState(device.label);
   const [profile, setProfile] = useState(device.profile || 'personal');
   const [owner, setOwner] = useState(device.owner || actor.subject);
-  const [grants, setGrants] = useState(device.grants?.map(grant => `${grant.subject}=${grant.capabilities.join(',')}`).join('\n') || '');
+  const supported = Object.keys(device.capabilities).filter(cap => device.capabilities[cap]);
+  const [grantList, setGrantList] = useState<Grant[]>(() => (device.grants || []).map(g => ({ subject: g.subject, capabilities: [...g.capabilities] })));
+  const [newSubject, setNewSubject] = useState('');
   const [confirmRevoke, setConfirmRevoke] = useState(false);
-  const requested = Object.keys(device.capabilities).filter(cap => device.capabilities[cap]);
+  const [confirmUnpair, setConfirmUnpair] = useState(false);
+
+  function addAgent(subject: string) {
+    const clean = subject.trim();
+    if (!clean || grantList.some(g => g.subject === clean)) return;
+    setGrantList(current => [...current, { subject: clean, capabilities: [...supported] }]);
+    setNewSubject('');
+  }
+
+  function toggleCap(subject: string, cap: string, checked: boolean) {
+    setGrantList(current => current.map(g => {
+      if (g.subject !== subject) return g;
+      const next = checked ? [...g.capabilities, cap] : g.capabilities.filter(c => c !== cap);
+      return { ...g, capabilities: next };
+    }));
+  }
+
   function onboard(event: FormEvent) {
     event.preventDefault();
-    const entries = grants.split('\n').map(value => value.trim()).filter(Boolean).map(value => {
-      const [subject, capabilities] = value.split('=', 2);
-      return { subject: subject.trim(), capabilities: capabilities?.split(',').map(item => item.trim()).filter(Boolean) || requested };
-    });
-    submit({ label: name, owner, profile, grants: entries, enabled: true });
+    const cleaned = grantList
+      .map(g => ({ subject: g.subject.trim(), capabilities: g.capabilities.filter(c => supported.includes(c)) }))
+      .filter(g => g.subject && g.capabilities.length > 0);
+    submit({ label: name, owner, profile, grants: cleaned, enabled: true });
   }
+
+  const hasLocalAgent = grantList.some(g => g.subject === 'local-agent');
+
   return <details className="enrollment" open={!device.enabled || undefined}>
     <summary>{device.enabled ? 'Enrollment and agent access' : 'Enroll this device'}</summary>
     <form onSubmit={onboard}>
@@ -216,13 +271,64 @@ function EnrollmentForm({ actor, device, busy, submit }: { actor: Actor; device:
         <label>Owner identity<input required value={owner} onChange={event => setOwner(event.target.value)} /></label>
         <label>Access profile<select value={profile} onChange={event => setProfile(event.target.value as 'personal' | 'dedicated')}><option value="personal">Personal · approval required</option>{device.mode !== 'companion' && <option value="dedicated">Dedicated · agent grants</option>}</select></label>
       </div>
-      <label>Agent grants<textarea rows={2} placeholder={`${actor.workspace === 'local' ? 'local-agent' : 'agent-identity'}=screen,ui_tree,touch`} value={grants} onChange={event => setGrants(event.target.value)} /></label>
-      <p className="hint">Use one identity per line, optionally followed by <code>=</code> and a list of permitted capabilities.</p>
-      <div className="actions"><button className="primary" disabled={busy}>{device.enabled ? 'Save access' : 'Enroll device'}</button>{device.enabled && !confirmRevoke && <button type="button" className="danger" disabled={busy} onClick={() => setConfirmRevoke(true)}>Revoke enrollment</button>}</div>
+      <div className="grants-editor">
+        <div className="grants-header">
+          <span>Agent grants</span>
+          {actor.workspace === 'local' && !hasLocalAgent && (
+            <button type="button" onClick={() => addAgent('local-agent')}>+ Allow local-agent (MCP)</button>
+          )}
+        </div>
+        {grantList.length === 0 ? (
+          <p className="hint">No agent identities granted yet. Add an agent identity to permit MCP or API sessions.</p>
+        ) : (
+          <ul className="grants-list">
+            {grantList.map(grant => (
+              <li key={grant.subject} className="grant-card">
+                <div className="grant-card-head">
+                  <code>{grant.subject}</code>
+                  <button type="button" className="danger" onClick={() => setGrantList(curr => curr.filter(g => g.subject !== grant.subject))}>Remove</button>
+                </div>
+                <div className="cap-options">
+                  {supported.map(cap => (
+                    <label key={cap}>
+                      <input
+                        type="checkbox"
+                        checked={grant.capabilities.includes(cap)}
+                        onChange={e => toggleCap(grant.subject, cap, e.target.checked)}
+                      />
+                      {labels[cap] || cap}
+                    </label>
+                  ))}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="grant-add-row">
+          <input
+            aria-label="Agent identity to grant"
+            placeholder={actor.workspace === 'local' ? 'local-agent' : 'agent-identity'}
+            value={newSubject}
+            onChange={e => setNewSubject(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addAgent(newSubject); } }}
+          />
+          <button type="button" disabled={!newSubject.trim()} onClick={() => addAgent(newSubject)}>Add agent</button>
+        </div>
+      </div>
+      <div className="actions">
+        <button className="primary" disabled={busy}>{device.enabled ? 'Save access' : 'Enroll device'}</button>
+        {device.enabled && !confirmRevoke && <button type="button" className="danger" disabled={busy} onClick={() => setConfirmRevoke(true)}>Revoke enrollment</button>}
+        {onUnpair && !confirmUnpair && <button type="button" className="danger" disabled={busy} onClick={() => setConfirmUnpair(true)}>Unpair companion</button>}
+      </div>
       {device.enabled && confirmRevoke && <div className="confirm-revoke" role="group" aria-label="Confirm enrollment revocation">
         <p>Revoking ends active sessions and removes agent access.</p>
         <div className="actions"><button type="button" disabled={busy} onClick={() => setConfirmRevoke(false)}>Cancel</button>
           <button type="button" className="danger" disabled={busy} onClick={() => { setConfirmRevoke(false); submit({ label: device.label, owner: device.owner, profile: device.profile, grants: device.grants, enabled: false }); }}>Confirm revoke</button></div>
+      </div>}
+      {onUnpair && confirmUnpair && <div className="confirm-revoke" role="group" aria-label="Confirm companion unpairing">
+        <p>Unpairing disconnects the Android companion app and revokes its token.</p>
+        <div className="actions"><button type="button" disabled={busy} onClick={() => setConfirmUnpair(false)}>Cancel</button>
+          <button type="button" className="danger" disabled={busy} onClick={() => { setConfirmUnpair(false); onUnpair(); }}>Confirm unpair</button></div>
       </div>}
     </form>
   </details>;
@@ -286,7 +392,7 @@ function MaintenanceForm({ device, token, session, onAttempt }: { device: Device
   </details>;
 }
 
-function Viewer({ token, actor, session, supportsVideo, captureRevision, onError }: { token: string; actor: Actor; session: Session; supportsVideo: boolean; captureRevision?: number; onError: (message: string) => void }) {
+function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, captureRevision, onError }: { token: string; actor: Actor; session: Session; supportsVideo: boolean; supportsNavKeys?: boolean; captureRevision?: number; onError: (message: string) => void }) {
   const [frame, setFrame] = useState<Observation>();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -382,8 +488,12 @@ function Viewer({ token, actor, session, supportsVideo, captureRevision, onError
         if (Math.hypot(point.x - end.x, point.y - end.y) > 0.04) perform({ type: 'swipe', point, end });
         else perform({ type: 'tap', point });
       }} /> : <div className="screen-empty"><PhoneMark /><span>Capture a screen to inspect the session.</span></div>}</div>
-    {controller && frame && !live && <div className="viewer-keys"><button type="button" onClick={() => perform({ type: 'key', key: 'home' })} disabled={busy}>Home</button>
-      {session.capabilities.includes('text') && <form onSubmit={event => { event.preventDefault(); perform({ type: 'type', text }); setText(''); }}><input aria-label="Text to type on the phone" value={text} onChange={event => setText(event.target.value)} /><button disabled={busy || !text}>Type</button></form>}</div>}
+    {controller && frame && !live && <div className="viewer-keys">
+      <button type="button" onClick={() => perform({ type: 'key', key: 'home' })} disabled={busy}>Home</button>
+      {supportsNavKeys && <button type="button" onClick={() => perform({ type: 'key', key: 'back' })} disabled={busy}>Back</button>}
+      {supportsNavKeys && <button type="button" onClick={() => perform({ type: 'key', key: 'overview' })} disabled={busy}>Overview</button>}
+      {session.capabilities.includes('text') && <form onSubmit={event => { event.preventDefault(); perform({ type: 'type', text }); setText(''); }}><input aria-label="Text to type on the phone" value={text} onChange={event => setText(event.target.value)} /><button disabled={busy || !text}>Type</button></form>}
+    </div>}
   </section>;
 }
 

@@ -119,12 +119,15 @@ func (a *Auth) challenge(w http.ResponseWriter, origin string) {
 }
 
 type HTTPOptions struct {
-	Origin  string
-	Auth    *Auth
-	MCP     http.Handler
-	Console http.Handler
-	Extra   func(*http.ServeMux)
-	Video   *VideoService
+	Origin        string
+	ExtraOrigins  []string
+	Auth          *Auth
+	MCP           http.Handler
+	Console       http.Handler
+	Extra         func(*http.ServeMux)
+	Video         *VideoService
+	LocalExchange bool
+	SystemInfo    func(wire.Actor) map[string]any
 }
 
 func (s *Service) HTTP(options HTTPOptions) http.Handler {
@@ -134,6 +137,17 @@ func (s *Service) HTTP(options HTTPOptions) http.Handler {
 		options.Video.Routes(protected)
 	}
 	protected.HandleFunc("GET /v1/me", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) { writeJSON(w, 200, actor) }))
+	protected.HandleFunc("GET /v1/system/info", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+		if options.SystemInfo != nil {
+			writeJSON(w, 200, options.SystemInfo(actor))
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"mode":              "remote",
+			"origin":            options.Origin,
+			"companion_enabled": s.Hub.Companion != nil,
+		})
+	}))
 	protected.HandleFunc("GET /v1/devices", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		devices, err := s.Store.Devices(r.Context(), actor, time.Now())
 		respond(w, 200, devices, err)
@@ -215,7 +229,7 @@ func (s *Service) HTTP(options HTTPOptions) http.Handler {
 		writeJSON(w, 200, map[string]bool{"ready": true})
 	})
 	router.HandleFunc("GET /auth/config", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, 200, map[string]any{"issuer": options.Auth.Issuer, "client_id": options.Auth.ConsoleClient, "authorization_endpoint": options.Auth.AuthorizationEndpoint, "token_endpoint": options.Auth.TokenEndpoint, "resource": options.Auth.Audience, "companion_enabled": s.Hub.Companion != nil})
+		writeJSON(w, 200, map[string]any{"issuer": options.Auth.Issuer, "client_id": options.Auth.ConsoleClient, "authorization_endpoint": options.Auth.AuthorizationEndpoint, "token_endpoint": options.Auth.TokenEndpoint, "resource": options.Auth.Audience, "companion_enabled": s.Hub.Companion != nil, "local_exchange": options.LocalExchange})
 	})
 	if options.Auth.Issuer != "" {
 		metadata := func(w http.ResponseWriter, _ *http.Request) {
@@ -233,11 +247,32 @@ func (s *Service) HTTP(options HTTPOptions) http.Handler {
 	if options.Console != nil {
 		router.Handle("/", options.Console)
 	}
-	return perimeter(router, options.Origin, options.Auth.TokenEndpoint)
+	origins := append([]string{options.Origin}, options.ExtraOrigins...)
+	return perimeterHosts(router, origins, options.Auth.TokenEndpoint)
 }
 
 func perimeter(next http.Handler, origin, tokenEndpoint string) http.Handler {
-	canonical, _ := url.Parse(origin)
+	return perimeterHosts(next, []string{origin}, tokenEndpoint)
+}
+
+func perimeterHosts(next http.Handler, origins []string, tokenEndpoint string) http.Handler {
+	var canonicals []*url.URL
+	var rawOrigins []string
+	hasHTTPS := false
+	for _, item := range origins {
+		if item == "" {
+			continue
+		}
+		parsed, err := url.Parse(item)
+		if err != nil || parsed.Host == "" {
+			continue
+		}
+		canonicals = append(canonicals, parsed)
+		rawOrigins = append(rawOrigins, item)
+		if parsed.Scheme == "https" {
+			hasHTTPS = true
+		}
+	}
 	connect := "'self'"
 	if endpoint, err := url.Parse(tokenEndpoint); err == nil && endpoint.Scheme == "https" && endpoint.Host != "" {
 		connect += " https://" + endpoint.Host
@@ -249,16 +284,32 @@ func perimeter(next http.Handler, origin, tokenEndpoint string) http.Handler {
 		w.Header().Set("Content-Security-Policy", csp)
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Cache-Control", "no-store")
-		if canonical != nil && canonical.Scheme == "https" {
+		if hasHTTPS {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
-		if canonical == nil || !strings.EqualFold(r.Host, canonical.Host) && !(isLoopbackHost(r.Host) && (r.URL.Path == "/healthz" || r.URL.Path == "/readyz")) {
+		hostMatch := false
+		for _, canonical := range canonicals {
+			if strings.EqualFold(r.Host, canonical.Host) {
+				hostMatch = true
+				break
+			}
+		}
+		if !hostMatch && !(isLoopbackHost(r.Host) && (r.URL.Path == "/healthz" || r.URL.Path == "/readyz")) {
 			writeError(w, wire.Error("INVALID_HOST", "The request Host does not match the configured origin.", 400))
 			return
 		}
-		if supplied := r.Header.Get("Origin"); supplied != "" && !strings.EqualFold(supplied, origin) {
-			writeError(w, wire.ErrForbidden)
-			return
+		if supplied := r.Header.Get("Origin"); supplied != "" {
+			originMatch := false
+			for _, allowed := range rawOrigins {
+				if strings.EqualFold(supplied, allowed) {
+					originMatch = true
+					break
+				}
+			}
+			if !originMatch {
+				writeError(w, wire.ErrForbidden)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

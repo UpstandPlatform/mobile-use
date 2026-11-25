@@ -1,0 +1,273 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      android-code: ${{ steps.version.outputs.android-code }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
+            echo 'Release tags must use vMAJOR.MINOR.PATCH with components between 0 and 999.' >&2
+            exit 1
+          fi
+          code=$(( BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3] + 1 ))
+          git merge-base --is-ancestor HEAD origin/main
+          printf 'tag=%s\nversion=%s\nandroid-code=%s\n' "$GITHUB_REF_NAME" "${GITHUB_REF_NAME#v}" "$code" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  desktop:
+    needs: version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, windows, darwin]
+        arch: [amd64, arm64]
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci
+      - run: npm --prefix web run build
+      - name: Package the CLI and embedded console
+        run: |
+          base="mobile-use-$RELEASE_TAG-$GOOS-$GOARCH"
+          mkdir -p "build/$base" release
+          cp LICENSE README.md "build/$base/"
+          binary=mobile-use
+          if [[ "$GOOS" == windows ]]; then binary+=.exe; fi
+          go build -trimpath -ldflags "-s -w -X main.version=$RELEASE_TAG" -o "build/$base/$binary" ./cmd/mobile-use
+          if [[ "$GOOS-$GOARCH" == linux-amd64 ]]; then
+            test "$("build/$base/$binary" version)" = "$RELEASE_TAG"
+            MOBILE_USE_CONFIG_DIR="$RUNNER_TEMP/mobile-use-config" "build/$base/$binary" init
+          fi
+          if [[ "$GOOS" == windows ]]; then
+            (cd build && zip -q -r "../release/$base.zip" "$base")
+          else
+            tar -C build -czf "release/$base.tar.gz" "$base"
+          fi
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: desktop-${{ matrix.os }}-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+
+  android:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      ANDROID_VERSION_CODE: ${{ needs.version.outputs.android-code }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
+      - name: Build Android release packages
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+          cd android
+          bash gradlew :companion:assembleRelease :control:assembleRelease \
+            "-PmobileUseVersion=$RELEASE_VERSION" "-PmobileUseVersionCode=$ANDROID_VERSION_CODE"
+      - name: Sign and verify the APKs
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+        run: bash scripts/sign-android.sh
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-mobile-use-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and start both signed APKs on Android 16
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: bash scripts/verify-android-release.sh
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: android
+          path: release/*.apk
+          if-no-files-found: error
+
+  image:
+    needs: [version, checks]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: registry
+        run: printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.registry.outputs.image }}:${{ env.RELEASE_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.licenses=Apache-2.0
+          build-args: MOBILE_USE_VERSION=${{ env.RELEASE_TAG }}
+          provenance: mode=min
+          sbom: true
+      - name: Verify the registry manifest and save offline images
+        env:
+          IMAGE: ${{ steps.registry.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          ref="$IMAGE@$DIGEST"
+          docker buildx imagetools inspect --raw "$ref" | jq -e '
+            [.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'
+          printf '%s\n' "$ref" > release/oci-image.txt
+          for arch in amd64 arm64; do
+            docker pull --platform "linux/$arch" "$IMAGE:$RELEASE_TAG"
+            offline="$IMAGE:$RELEASE_TAG-linux-$arch"
+            docker tag "$IMAGE:$RELEASE_TAG" "$offline"
+            if [[ "$arch" == amd64 ]]; then
+              test "$(docker run --rm --platform "linux/$arch" "$offline" version)" = "$RELEASE_TAG"
+            fi
+            docker image save --platform "linux/$arch" "$offline" | gzip > "release/mobile-use-$RELEASE_TAG-oci-linux-$arch.tar.gz"
+          done
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: oci
+          path: release/*
+          if-no-files-found: error
+
+  tooling:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.19.0
+      - name: Package deployment files and SDKs
+        run: |
+          mkdir -p release
+          helm lint deploy/helm/mobile-use \
+            --set origin=https://mobile-use.example.test --set oidcIssuer=https://id.example.test \
+            --set oidcAudience=https://mobile-use.example.test/mcp
+          helm package deploy/helm/mobile-use --version "$RELEASE_VERSION" --app-version "$RELEASE_TAG" --destination release
+          tar -czf "release/mobile-use-$RELEASE_TAG-deploy.tar.gz" LICENSE README.md deploy docs/operations.md
+          tar -czf "release/mobile-use-$RELEASE_TAG-agent-sdks.tar.gz" LICENSE sdk api/openapi.yaml
+          python -m pip install build==1.3.0
+          sed -i "s/^version = .*/version = \"$RELEASE_VERSION\"/" sdk/python/pyproject.toml
+          python -m build --wheel --outdir release sdk/python
+          python -m pip install --no-deps release/*.whl
+          python -c 'from mobile_use import Client; Client("http://127.0.0.1:8787", "test")'
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: tooling
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, checks, desktop, android, image, tooling]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Verify uploaded assets before publishing
+        run: |
+          set -euo pipefail
+          cd release
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 15
+          test -s "mobile-use-companion-$RELEASE_TAG.apk"
+          test -s "mobile-use-control-$RELEASE_TAG.apk"
+          test -s oci-image.txt
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          cp "$RUNNER_TEMP/SHA256SUMS" .
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            if [[ "$(jq -r .isDraft "$RUNNER_TEMP/release.json")" == false ]]; then
+              echo 'Release already published. Published assets are preserved.'
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "mobile-use $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber -- *
+          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --pattern '*' --dir "$RUNNER_TEMP/downloaded"
+          (cd "$RUNNER_TEMP/downloaded" && sha256sum -c SHA256SUMS)
+          gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest

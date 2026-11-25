@@ -132,11 +132,11 @@ function App() {
   return <div className="layout">
     <header className="top">
       <a className="brand" href="/"> <PhoneMark small /> <span>mobile-use</span></a>
-      <nav aria-label="Workspace">{tabs.map(item => <button key={item} type="button" className={item === tab ? 'nav-active' : ''} onClick={() => setTab(item)}>{item}</button>)}</nav>
+      <nav aria-label="Workspace">{tabs.map(item => <button key={item} type="button" aria-current={item === tab ? 'page' : undefined} onClick={() => setTab(item)}>{item}</button>)}</nav>
       <div className="identity"><span>{actor.workspace}</span><button type="button" onClick={signOut}>Sign out</button></div>
     </header>
     <main className="workspace">
-      <div className="title-row"><div><h1>{tab}</h1><p>{tab === 'Devices' ? 'Enroll phones and review active control sessions.' : tab === 'Sessions' ? 'Review requests and control access to your devices.' : 'Review workspace enrollment and session events.'}</p></div>
+      <div className="title-row"><h1>{tab}</h1>
         <div className="actions">{oidc?.companion_enabled && tab === 'Devices' && (manage || actor.role === 'owner') && <button type="button" className="primary" onClick={() => run(async () => setPairing(await api(token, '/v1/companion/pairing', 'POST')))} disabled={busy}>Pair Android</button>}
           <button type="button" onClick={() => run(() => refresh(token, actor))} disabled={busy}>Refresh</button></div>
       </div>
@@ -147,7 +147,10 @@ function App() {
         <button type="button" onClick={() => setPairing(undefined)}>Close</button>
       </section>}
       {tab === 'Devices' && <div className="device-layout">
-        <section className="surface inventory" aria-label="Device inventory">
+        {devices.length > 1 && <label className="device-picker">Device<select value={selected} onChange={event => setSelected(event.target.value)}>
+          {devices.map(item => <option key={item.id} value={item.id}>{item.label} · {item.online ? 'Online' : 'Offline'}</option>)}
+        </select></label>}
+        <section className={`surface inventory${devices.length ? ' inventory-populated' : ''}`} aria-label="Device inventory">
           <div className="section-heading"><h2>Inventory</h2><span>{devices.length} {devices.length === 1 ? 'device' : 'devices'}</span></div>
           {devices.length === 0 ? <div className="empty"><PhoneMark /><h3>No devices available</h3><p>Connect an authorized phone or start an emulator on an enrolled connector.</p></div> : <ul className="device-list">{devices.map(item => <li key={item.id}>
             <button type="button" className={item.id === selected ? 'selected' : ''} onClick={() => setSelected(item.id)} aria-pressed={item.id === selected}>
@@ -157,15 +160,15 @@ function App() {
           </li>)}</ul>}
         </section>
         {device && <section className="surface detail" aria-label="Selected device">
-          <div className="section-heading"><div><h2>{device.label}</h2><span>{device.connector || device.mode}</span></div><Badge tone={device.enabled ? 'green' : 'amber'}>{device.enabled ? 'Enrolled' : 'Unenrolled'}</Badge></div>
+          <div className="section-heading"><div><h2>{device.label}</h2><span>{device.platform === 'ios' ? 'iOS' : 'Android'} · {device.connector || device.mode}</span></div><Badge tone={device.online ? 'green' : 'neutral'}>{device.online ? 'Online' : 'Offline'}</Badge></div>
           <div className="detail-body">
-            <div className="chips">{Object.entries(device.capabilities).filter(([, available]) => available).map(([cap]) => <span key={cap}>{labels[cap] || cap}</span>)}</div>
+            {deviceSessions.length > 0 && <SessionList sessions={deviceSessions} devices={devices} actor={actor} busy={busy} change={change} selectedDevice={device.id} />}
             {active && <Viewer key={`${active.id}:${active.controller}`} token={token} actor={actor} session={active} supportsVideo={device.live_video} captureRevision={captureRevision} onError={setError} />}
-            {deviceSessions.length > 0 && <SessionList sessions={deviceSessions} devices={devices} actor={actor} busy={busy} change={change} />}
             {manage && active?.controller === actor.subject && device.profile === 'dedicated' && !!device.catalog?.length && active.capabilities.includes('apps') && active.capabilities.includes('touch') && !active.paused &&
               <MaintenanceForm key={active.id} device={device} token={token} session={active} onAttempt={() => setCaptureRevision(value => value + 1)} />}
             {device.enabled && device.online && !active && actor.role !== 'auditor' && <StartForm key={`start-${device.id}`} device={device} busy={busy} submit={body => run(() => api(token, '/v1/sessions', 'POST', body))} />}
             {manage && <EnrollmentForm key={device.id} actor={actor} device={device} busy={busy} submit={body => run(() => api(token, `/v1/devices/${device.id}`, 'PUT', body))} />}
+            <details className="enrollment capability-list"><summary>Device capabilities</summary><p>{Object.keys(device.capabilities).filter(cap => device.capabilities[cap]).map(cap => labels[cap] || cap).join(' · ') || 'None available'}</p></details>
           </div>
         </section>}
       </div>}
@@ -175,11 +178,11 @@ function App() {
   </div>;
 }
 
-function SessionList({ sessions, devices, actor, busy, change }: { sessions: Session[]; devices: Device[]; actor: Actor; busy: boolean; change: (item: Session, verb: string) => void }) {
+function SessionList({ sessions, devices, actor, busy, change, selectedDevice }: { sessions: Session[]; devices: Device[]; actor: Actor; busy: boolean; change: (item: Session, verb: string) => void; selectedDevice?: string }) {
   if (sessions.length === 0) return <p className="empty">No active sessions or requests.</p>;
   return <ul className="sessions">{sessions.map(item => <li key={item.id}>
     <div><Badge tone={item.state === 'active' && !item.paused ? 'green' : 'amber'}>{item.paused ? 'Paused' : item.state === 'active' ? 'Active' : 'Approval requested'}</Badge><h3>{item.purpose}</h3>
-      <p>{devices.find(device => device.id === item.device_id)?.label || 'Phone'} · {item.requester} · expires {time(item.expires_at)}</p>
+      <p>{selectedDevice ? '' : `${devices.find(device => device.id === item.device_id)?.label || 'Phone'} · `}{item.requester} · expires {time(item.expires_at)}</p>
       <small>{item.capabilities.map(cap => labels[cap] || cap).join(', ')}</small>
     </div>
     {item.owner === actor.subject && item.state === 'pending_approval' && <div className="actions"><button type="button" disabled={busy} onClick={() => change(item, 'deny')}>Deny</button><button className="primary" type="button" disabled={busy} onClick={() => change(item, 'approve')}>Approve</button></div>}
@@ -196,6 +199,7 @@ function EnrollmentForm({ actor, device, busy, submit }: { actor: Actor; device:
   const [profile, setProfile] = useState(device.profile || 'personal');
   const [owner, setOwner] = useState(device.owner || actor.subject);
   const [grants, setGrants] = useState(device.grants?.map(grant => `${grant.subject}=${grant.capabilities.join(',')}`).join('\n') || '');
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
   const requested = Object.keys(device.capabilities).filter(cap => device.capabilities[cap]);
   function onboard(event: FormEvent) {
     event.preventDefault();
@@ -213,8 +217,13 @@ function EnrollmentForm({ actor, device, busy, submit }: { actor: Actor; device:
         <label>Access profile<select value={profile} onChange={event => setProfile(event.target.value as 'personal' | 'dedicated')}><option value="personal">Personal · approval required</option>{device.mode !== 'companion' && <option value="dedicated">Dedicated · agent grants</option>}</select></label>
       </div>
       <label>Agent grants<textarea rows={2} placeholder={`${actor.workspace === 'local' ? 'local-agent' : 'agent-identity'}=screen,ui_tree,touch`} value={grants} onChange={event => setGrants(event.target.value)} /></label>
-      <p className="hint">Use one identity per line. Add an equals sign and a capability list to limit its access.</p>
-      <div className="actions"><button className="primary" disabled={busy}>{device.enabled ? 'Save access' : 'Enroll device'}</button>{device.enabled && <button type="button" className="danger" disabled={busy} onClick={() => submit({ label: device.label, owner: device.owner, profile: device.profile, grants: device.grants, enabled: false })}>Revoke enrollment</button>}</div>
+      <p className="hint">Use one identity per line, optionally followed by <code>=</code> and a list of permitted capabilities.</p>
+      <div className="actions"><button className="primary" disabled={busy}>{device.enabled ? 'Save access' : 'Enroll device'}</button>{device.enabled && !confirmRevoke && <button type="button" className="danger" disabled={busy} onClick={() => setConfirmRevoke(true)}>Revoke enrollment</button>}</div>
+      {device.enabled && confirmRevoke && <div className="confirm-revoke" role="group" aria-label="Confirm enrollment revocation">
+        <p>Revoking ends active sessions and removes agent access.</p>
+        <div className="actions"><button type="button" disabled={busy} onClick={() => setConfirmRevoke(false)}>Cancel</button>
+          <button type="button" className="danger" disabled={busy} onClick={() => { setConfirmRevoke(false); submit({ label: device.label, owner: device.owner, profile: device.profile, grants: device.grants, enabled: false }); }}>Confirm revoke</button></div>
+      </div>}
     </form>
   </details>;
 }
@@ -223,7 +232,7 @@ function StartForm({ device, busy, submit }: { device: Device; busy: boolean; su
   const [purpose, setPurpose] = useState('');
   const options = Object.keys(device.capabilities).filter(cap => device.capabilities[cap]);
   const [selected, setSelected] = useState(options.filter(cap => ['screen', 'touch', 'ui_tree', 'text'].includes(cap)));
-  return <details className="enrollment session-start">
+  return <details className="enrollment session-start request-session">
     <summary>Request a session</summary>
     <form onSubmit={event => { event.preventDefault(); submit({ device_id: device.id, purpose, capabilities: selected }); }}>
       <label>Purpose<input minLength={3} maxLength={256} required value={purpose} onChange={event => setPurpose(event.target.value)} /></label>

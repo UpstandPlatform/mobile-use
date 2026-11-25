@@ -12,12 +12,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
@@ -151,24 +159,46 @@ class MainActivity : ComponentActivity() {
         catch (_: Exception) { file.delete(); photoFile = null; photoRequest = null; message = "A system camera app is unavailable." }
     }
 
+    private fun stopSession(id: String) {
+        val current = pairing ?: return
+        attending = null
+        projectionId = null
+        micRequest = null
+        micJob?.cancel()
+        ScreenShareService.stop(this)
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) { CompanionApi(current).session(id, "end") }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { message = "Sharing stopped on this phone. The console will update when it reconnects." }
+        }
+    }
+
     @Composable
     private fun CompanionUI() {
         val sharing by Sharing.session.collectAsState()
-        var origin by remember { mutableStateOf("") }
+        var origin by rememberSaveable { mutableStateOf("") }
         var code by remember { mutableStateOf("") }
         var confirmDisconnect by remember { mutableStateOf(false) }
         val colors = lightColorScheme(primary = Color(0xFF405B30), primaryContainer = Color(0xFFD7ED99),
             onPrimaryContainer = Color(0xFF243419), background = Color(0xFFF5F5EF), surface = Color(0xFFFDFDF8))
         MaterialTheme(colorScheme = colors) {
             Surface(modifier = Modifier.fillMaxSize(), color = colors.background) {
-                Column(Modifier.safeDrawingPadding().verticalScroll(rememberScrollState()).padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Image(painterResource(R.drawable.mobile_use_icon), null, Modifier.size(52.dp))
-                    Text("mobile-use", style = MaterialTheme.typography.headlineMedium)
+              Box(Modifier.fillMaxSize().safeDrawingPadding().imePadding(), contentAlignment = Alignment.TopCenter) {
+                Column(Modifier.widthIn(max = 480.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Image(painterResource(R.drawable.mobile_use_icon), null, Modifier.size(36.dp))
+                        Text("mobile-use", style = MaterialTheme.typography.titleMedium)
+                    }
                     if (pairing == null) {
-                        Text("Pair this phone with your mobile-use console.")
-                        OutlinedTextField(origin, { origin = it }, label = { Text("HTTPS server") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                        OutlinedTextField(code, { code = it }, label = { Text("Pairing code") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                        Button(enabled = !busy && origin.isNotBlank() && code.isNotBlank(), onClick = {
+                        Text("Pair your phone", style = MaterialTheme.typography.headlineSmall)
+                        Text("In the console, choose Pair Android to get the server address and code.", color = colors.onSurfaceVariant)
+                        OutlinedTextField(origin, { origin = it }, label = { Text("Server address") }, placeholder = { Text("https://") }, singleLine = true,
+                            enabled = !busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next), modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(code, { code = it.trim() }, label = { Text("Pairing code") }, singleLine = true,
+                            enabled = !busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, autoCorrectEnabled = false, imeAction = ImeAction.Done),
+                            modifier = Modifier.fillMaxWidth())
+                        Button(enabled = !busy && origin.isNotBlank() && code.isNotBlank(), modifier = Modifier.fillMaxWidth(), onClick = {
                             busy = true; message = ""
                             lifecycleScope.launch {
                                 try {
@@ -183,47 +213,47 @@ class MainActivity : ComponentActivity() {
                             }
                         }) { Text(if (busy) "Pairing…" else "Pair phone") }
                     } else {
-                        Text(if (online) "Connected to your console" else "Waiting for connection")
-                        if (status.sessions.isEmpty()) Text("New sharing requests appear here. Open the console to enroll this phone or assign an agent.")
+                        Text(if (online) "Connected" else "Waiting for connection", style = MaterialTheme.typography.headlineSmall)
+                        if (status.sessions.isEmpty()) Text("Sharing requests from your console will appear here.", color = colors.onSurfaceVariant)
                         status.sessions.forEach { item ->
-                            ElevatedCard(Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                            OutlinedCard(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(item.purpose, style = MaterialTheme.typography.titleMedium)
-                                    Text(item.requester)
-                                    Text(item.caps.joinToString(", ") { it.replace('_', ' ') }, style = MaterialTheme.typography.bodySmall)
+                                    Text(item.requester, color = colors.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                                    Text(item.caps.joinToString(" · ") { it.replace('_', ' ').replaceFirstChar(Char::uppercase) }, style = MaterialTheme.typography.bodySmall)
                                     if (item.state == "pending_approval") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(enabled = !busy, onClick = { execute { it.session(item.id, "approve"); withContext(Dispatchers.Main) { attending = item.id } } }) { Text("Approve") }
-                                        OutlinedButton(enabled = !busy, onClick = { execute { it.session(item.id, "deny") } }) { Text("Deny") }
-                                    } else if (item.state == "active") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        if (sharing != item.id && "screen" in item.caps) Button(enabled = !busy, onClick = { share(item.id) }) { Text("Share screen") }
-                                        OutlinedButton(onClick = {
-                                            attending = null
-                                            ScreenShareService.stop(this@MainActivity)
-                                            execute { it.session(item.id, "end") }
-                                        }) { Text("Stop") }
+                                        Button(enabled = online && !busy, onClick = { execute { it.session(item.id, "approve"); withContext(Dispatchers.Main) { attending = item.id } } }) { Text("Approve") }
+                                        TextButton(enabled = online && !busy, onClick = { execute { it.session(item.id, "deny") } }) { Text("Deny") }
+                                    } else if (item.state == "active") {
+                                        if (sharing == item.id) Text("Sharing screen", color = colors.primary, style = MaterialTheme.typography.labelLarge)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            if (sharing != item.id && "screen" in item.caps) Button(enabled = online && !busy, onClick = { share(item.id) }) { Text("Share screen") }
+                                            OutlinedButton(onClick = { stopSession(item.id) }) { Text("Stop", color = colors.error) }
+                                        }
                                     }
                                 }
                             }
                         }
                         status.sensors.forEach { request ->
-                            ElevatedCard(Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedCard(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(if (request.type == "camera") "Camera photo requested" else "${request.seconds}-second microphone clip requested", style = MaterialTheme.typography.titleMedium)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(enabled = !busy, onClick = {
+                                        Button(enabled = online && !busy, onClick = {
                                             if (request.type == "camera") takePhoto(request)
                                             else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) record(request)
                                             else { micRequest = request; microphone.launch(Manifest.permission.RECORD_AUDIO) }
                                         }) { Text(if (request.type == "camera") "Open camera" else "Record clip") }
-                                        OutlinedButton(enabled = !busy, onClick = { execute { it.denySensor(request.id) } }) { Text("Deny") }
+                                        TextButton(enabled = online && !busy, onClick = { execute { it.denySensor(request.id) } }) { Text("Deny") }
                                     }
                                 }
                             }
                         }
                         TextButton(enabled = !busy, onClick = { confirmDisconnect = true }) { Text("Unpair phone") }
                     }
-                    if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodyMedium)
+                    if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
                 }
+              }
             }
             if (confirmDisconnect) AlertDialog(onDismissRequest = { confirmDisconnect = false },
                 title = { Text("Unpair this phone?") }, text = { Text("Sharing stops and this phone will need a new pairing code.") },
@@ -231,6 +261,7 @@ class MainActivity : ComponentActivity() {
                     ScreenShareService.stop(this@MainActivity)
                     val previous = pairing
                     store.clear(); pairing = null; attending = null
+                    online = false
                     status = Heartbeat(emptyList(), emptyList()); message = ""; confirmDisconnect = false
                     if (previous != null) lifecycleScope.launch(Dispatchers.IO) { runCatching { CompanionApi(previous).unpair() } }
                 }) { Text("Unpair") } }, dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("Cancel") } })

@@ -1,1 +1,3 @@
 deploy/postgres/initialize.sh text eol=lf
+android/gradlew text eol=lf
+*.sh text eol=lf

@@ -12,8 +12,8 @@ android {
         applicationId = "org.mobileuse.companion"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = providers.gradleProperty("mobileUseVersionCode").map(String::toInt).getOrElse(1)
+        versionName = providers.gradleProperty("mobileUseVersion").getOrElse("0.1.0-dev")
     }
 
     buildFeatures { compose = true }

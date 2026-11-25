@@ -1,6 +1,7 @@
 replicas: 2
 image: mobile-use:0.1.0
 imagePullPolicy: IfNotPresent
+imagePullSecrets: []
 origin: ""
 oidcIssuer: ""
 oidcAudience: ""

@@ -15,6 +15,7 @@ services:
       retries: 12
     restart: unless-stopped
   mobile-use:
+    image: ${MOBILE_USE_IMAGE:-mobile-use:local}
     build:
       context: ..
     depends_on:

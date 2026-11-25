@@ -85,6 +85,11 @@ class MainActivity : ComponentActivity() {
         micRequest = null
         if (granted) record(request) else execute { it.denySensor(request.id) }
     }
+    private val cameraCapturePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val request = photoRequest ?: return@registerForActivityResult
+        photoRequest = null
+        if (granted) launchCamera(request) else denySensorWithNotice(request.id, "Camera permission was denied.")
+    }
     private val camera = registerForActivityResult(ActivityResultContracts.TakePicture()) { approved ->
         val request = photoRequest
         val file = photoFile
@@ -199,12 +204,31 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun takePhoto(request: SensorRequest) {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            photoRequest = request
+            cameraCapturePermission.launch(Manifest.permission.CAMERA)
+            return
+        }
+        launchCamera(request)
+    }
+
+    private fun launchCamera(request: SensorRequest) {
         val folder = File(cacheDir, "approved-photos").apply { mkdirs() }
         val file = File.createTempFile("photo-", ".jpg", folder)
         photoRequest = request
         photoFile = file
         try { camera.launch(FileProvider.getUriForFile(this, "$packageName.photos", file)) }
-        catch (_: Exception) { file.delete(); photoFile = null; photoRequest = null; message = "A system camera app is unavailable." }
+        catch (_: Exception) {
+            file.delete(); photoFile = null; photoRequest = null
+            denySensorWithNotice(request.id, "A system camera app is unavailable.")
+        }
+    }
+
+    private fun denySensorWithNotice(requestId: String, notice: String) {
+        execute {
+            it.denySensor(requestId)
+            withContext(Dispatchers.Main) { message = notice }
+        }
     }
 
     private fun stopSession(id: String) {

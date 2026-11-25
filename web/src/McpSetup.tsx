@@ -10,10 +10,18 @@ export function McpSetup({
   systemInfo?: SystemInfo;
   onSelectDevice: (deviceId: string) => void;
 }) {
-  const exec = systemInfo?.mcp_executable || 'mobile-use';
-  const codexCmd = systemInfo?.mcp_commands?.codex || `codex mcp add mobile-use -- ${exec} mcp`;
-  const claudeCmd = systemInfo?.mcp_commands?.claude || `claude mcp add --transport stdio mobile-use -- ${exec} mcp`;
+  const remote = systemInfo?.mode === 'remote';
+  // A remote server's binary path belongs to the server host, not the operator's
+  // workstation. Remote clients use their local CLI and its saved server profile.
+  const exec = remote ? 'mobile-use' : systemInfo?.mcp_executable || 'mobile-use';
+  const codexCmd = remote
+    ? `codex mcp add mobile-use -- ${exec} mcp`
+    : systemInfo?.mcp_commands?.codex || `codex mcp add mobile-use -- ${exec} mcp`;
+  const claudeCmd = remote
+    ? `claude mcp add --transport stdio mobile-use -- ${exec} mcp`
+    : systemInfo?.mcp_commands?.claude || `claude mcp add --transport stdio mobile-use -- ${exec} mcp`;
   const httpUrl = systemInfo?.mcp_commands?.http || `${location.origin}/mcp`;
+  const remoteSetup = `mobile-use remote set --url ${systemInfo?.origin || location.origin} --token <AGENT_TOKEN>`;
   const desktopJson = JSON.stringify({
     mcpServers: {
       'mobile-use': {
@@ -57,6 +65,17 @@ export function McpSetup({
           </div>
         </div>
       </section>
+
+      {remote && (
+        <section className="surface mcp-card">
+          <div className="mcp-card-head">
+            <h3>Connect a local workstation</h3>
+            <CopyButton value={remoteSetup} />
+          </div>
+          <p className="hint">On the workstation that runs your agent, install the mobile-use CLI, replace the placeholder with an agent token for this server, and save the remote profile before registering the local MCP command.</p>
+          <pre><code>{remoteSetup}</code></pre>
+        </section>
+      )}
 
       <div className="mcp-cards">
         <section className="surface mcp-card">

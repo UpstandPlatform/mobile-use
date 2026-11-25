@@ -110,6 +110,7 @@ def main() -> None:
         if args.camera:
             sensor = operation("sensor_request", id=uuid.uuid4().hex, sensor={"type": "camera"})["sensor"]
             tap("open camera")
+            tap("while using the app", "only this time", optional=True, timeout=5)
             tap("shutter", "take photo", "take picture")
             tap("done", "use photo", "confirm", "save", "ok", "accept", "use picture")
             photo = wait_for(lambda: operation("artifact_get", sensor={"type": "camera", "request_id": sensor["id"]}), "artifact")

@@ -242,6 +242,9 @@ jobs:
       - name: Package deployment files and SDKs
         run: |
           mkdir -p release
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$RELEASE_TAG"
+          sed -i "s|^MOBILE_USE_IMAGE=.*|MOBILE_USE_IMAGE=$image|" deploy/mobile-use.env.example
+          sed -i "s|^image: .*|image: $image|" deploy/helm/mobile-use/values.yaml
           helm lint deploy/helm/mobile-use \
             --set origin=https://mobile-use.example.test --set oidcIssuer=https://id.example.test \
             --set oidcAudience=https://mobile-use.example.test/mcp

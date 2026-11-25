@@ -92,6 +92,7 @@ def main() -> None:
             time.sleep(0.35)
         raise AssertionError(f"Companion payload unavailable: {result.get('error')}")
 
+    ended_on_phone = False
     try:
         tap("approve")
         tap("share screen")
@@ -113,9 +114,19 @@ def main() -> None:
             tap("done", "use photo", "confirm", "save", "ok", "accept", "use picture")
             photo = wait_for(lambda: operation("artifact_get", sensor={"type": "camera", "request_id": sensor["id"]}), "artifact")
             assert photo["mime"] == "image/jpeg"
+        tap("stop")
+        for _ in range(12):
+            if api("agent", base)["state"] == "ended":
+                ended_on_phone = True
+                break
+            time.sleep(0.4)
+        else:
+            raise AssertionError("The phone's Stop control did not end the session")
     finally:
-        api("admin", base + "/end", method="POST")
-    print("Passed companion approval, Android screen projection and microphone" + (" and camera" if args.camera else ""))
+        if not ended_on_phone:
+            api("admin", base + "/end", method="POST")
+    checks = "approval, Android screen projection, microphone" + (", camera" if args.camera else "")
+    print(f"Passed companion {checks}, and on-device stop")
 
 
 if __name__ == "__main__":

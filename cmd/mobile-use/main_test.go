@@ -100,3 +100,22 @@ func TestMCPConfigJSON(t *testing.T) {
 		t.Fatalf("missing codex command in mcp-config: %s", buf.String())
 	}
 }
+
+func TestParseConnectorMapRejectsCompanionPrefix(t *testing.T) {
+	if _, err := parseConnectorMap("companion.lab=team"); err == nil {
+		t.Fatal("expected a companion.-prefixed connector name to be rejected")
+	}
+	got, err := parseConnectorMap("lab-1=team,companionlab=team")
+	if err != nil || got["lab-1"] != "team" || got["companionlab"] != "team" {
+		t.Fatalf("valid allowlist: %v %v", got, err)
+	}
+}
+
+func TestBackendsAppiumRequiresIOSConfig(t *testing.T) {
+	noAndroid, appium, ios, ffmpeg := true, "http://127.0.0.1:4723", "", "ffmpeg"
+	flags := backendFlags{noAndroid: &noAndroid, appium: &appium, ios: &ios, iosFFmpeg: &ffmpeg}
+	_, err := flags.backends()
+	if err == nil || !strings.Contains(err.Error(), "--ios-config") {
+		t.Fatalf("expected a clear --ios-config error, got %v", err)
+	}
+}

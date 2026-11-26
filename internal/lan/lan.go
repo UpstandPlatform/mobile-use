@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -229,7 +230,9 @@ func validExistingCert(certPath, keyPath string, requiredIPs []string) (string, 
 	if err != nil {
 		return "", false
 	}
-	if _, err := os.Stat(keyPath); err != nil {
+	// The key and certificate are replaced in two steps; a partial write leaves a pair that
+	// the TLS listener cannot load, so reuse only a matching, loadable pair.
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
 		return "", false
 	}
 	block, _ := pem.Decode(certPEM)

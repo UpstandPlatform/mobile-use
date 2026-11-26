@@ -426,7 +426,9 @@ func connectOnce(parent context.Context, conn *grpc.ClientConn, manager *connect
 	setup.Stop()
 	outgoing := make(chan Message, 64)
 	failed := make(chan error, 1)
+	senderDone := make(chan struct{})
 	go func() {
+		defer close(senderDone)
 		for {
 			select {
 			case <-ctx.Done():
@@ -440,6 +442,8 @@ func connectOnce(parent context.Context, conn *grpc.ClientConn, manager *connect
 			}
 		}
 	}()
+	// The deferred CloseSend must not run concurrently with the sender's SendMsg.
+	defer func() { cancel(); <-senderDone }()
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()

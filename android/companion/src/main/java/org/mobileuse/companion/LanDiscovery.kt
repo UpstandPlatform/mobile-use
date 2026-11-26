@@ -25,26 +25,30 @@ class LanDiscovery(context: Context) {
     private val callbacks = ConcurrentHashMap<String, NsdManager.ServiceInfoCallback>()
     private val _hosts = MutableStateFlow<List<DiscoveredHost>>(emptyList())
     val hosts: StateFlow<List<DiscoveredHost>> = _hosts.asStateFlow()
-    private var activeListener: NsdManager.DiscoveryListener? = null
+    // NSD delivers listener callbacks on its own thread, and a stopped listener can report
+    // onDiscoveryStopped after a newer listener has started, so only clear our own entry.
+    @Volatile private var activeListener: NsdManager.DiscoveryListener? = null
 
     fun start() {
         val manager = nsd ?: return
         if (activeListener != null) return
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) { activeListener = null }
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { activeListener = null }
-            override fun onDiscoveryStopped(serviceType: String) { activeListener = null }
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) { clearListener(this) }
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { clearListener(this) }
+            override fun onDiscoveryStopped(serviceType: String) { clearListener(this) }
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 val key = serviceInfo.serviceName
                 if (callbacks.containsKey(key)) return
                 val cb = object : NsdManager.ServiceInfoCallback {
                     override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
-                        callbacks.remove(key)
+                        callbacks.remove(key, this)
                     }
 
                     override fun onServiceUpdated(info: NsdServiceInfo) {
+                        // Ignore late updates from a callback that stop() or onServiceLost already dropped.
+                        if (callbacks[key] !== this) return
                         val ip = info.hostAddresses.firstOrNull { it is Inet4Address }?.hostAddress
                             ?: info.hostAddresses.firstOrNull()?.hostAddress
                             ?: return
@@ -66,17 +70,18 @@ class LanDiscovery(context: Context) {
                     }
 
                     override fun onServiceLost() {
+                        if (callbacks[key] !== this) return
                         entries.remove(key)
                         publish()
                     }
 
                     override fun onServiceInfoCallbackUnregistered() {
-                        callbacks.remove(key)
+                        callbacks.remove(key, this)
                     }
                 }
                 callbacks[key] = cb
                 runCatching { manager.registerServiceInfoCallback(serviceInfo, executor, cb) }
-                    .onFailure { callbacks.remove(key) }
+                    .onFailure { callbacks.remove(key, cb) }
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
@@ -88,7 +93,11 @@ class LanDiscovery(context: Context) {
         }
         activeListener = listener
         runCatching { manager.discoverServices("_mobile-use._tcp.", NsdManager.PROTOCOL_DNS_SD, listener) }
-            .onFailure { activeListener = null }
+            .onFailure { clearListener(listener) }
+    }
+
+    private fun clearListener(listener: NsdManager.DiscoveryListener) {
+        if (activeListener === listener) activeListener = null
     }
 
     fun stop() {

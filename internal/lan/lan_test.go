@@ -2,6 +2,10 @@ package lan
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
@@ -57,6 +61,36 @@ func TestEnsureCompanionTLSReuseAndRegen(t *testing.T) {
 	}
 	if fp3 == fp1 {
 		t.Fatal("expected regenerated certificate when new IP added")
+	}
+}
+
+func TestEnsureCompanionTLSRegeneratesMismatchedKey(t *testing.T) {
+	dir := t.TempDir()
+	_, keyPath, fp1, err := EnsureCompanionTLS(dir, []string{"192.168.1.50"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an interrupted rotation: a new key was written but the certificate was not.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath, fp2, err := EnsureCompanionTLS(dir, []string{"192.168.1.50"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp2 == fp1 {
+		t.Fatal("expected a new certificate when the stored key does not match")
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		t.Fatalf("regenerated pair must load: %v", err)
 	}
 }
 

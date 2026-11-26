@@ -79,7 +79,9 @@ function App() {
       api<SystemInfo>(token, '/v1/system/info').then(info => {
         if (!ignore) setSystemInfo(info);
       }).catch(() => undefined);
-      await refresh(token, identity);
+      // A failed inventory/audit refresh (this effect re-runs on every tab change) is not
+      // an authentication failure and must not drop the signed-in identity.
+      await refresh(token, identity).catch(error => { if (!ignore) setError(errorText(error)); });
     }).catch(error => {
       if (!ignore) {
         setActor(undefined);
@@ -118,6 +120,8 @@ function App() {
     setDevices([]);
     setSessions([]);
     setAudits([]);
+    setSelected('');
+    setTab('Devices');
     setShowAddDevice(false);
     setError('');
   }

@@ -68,7 +68,7 @@ func (c *Client) Request(ctx context.Context, method, path string, input, output
 		}
 		return fmt.Errorf("mobile-use returned HTTP %d", response.StatusCode)
 	}
-	if output == nil {
+	if output == nil || response.StatusCode == http.StatusNoContent {
 		return nil
 	}
 	if out, ok := output.(*json.RawMessage); ok {

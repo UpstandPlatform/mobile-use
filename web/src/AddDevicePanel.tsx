@@ -96,19 +96,25 @@ export function AddDevicePanel({
 
   useEffect(() => {
     if (!pairing || pairStatus?.state === 'paired' || pairStatus?.state === 'expired') return;
+    // A poll that is still in flight when the pairing session is replaced (new code, other
+    // interface, auto-enroll toggle) must not apply the old session's status to the new one.
+    let cancelled = false;
+    let reported = false;
     const timer = window.setInterval(async () => {
       setNowMs(Date.now());
       try {
         const next = await api<PairingStatus>(token, `/v1/companion/pairing/${pairing.id}`);
+        if (cancelled) return;
         setPairStatus(next);
-        if (next.state === 'paired') {
+        if (next.state === 'paired' && !reported) {
+          reported = true;
           await onDeviceAdded(next.device_id);
         }
       } catch {
         // Ignore transient poll errors while waiting
       }
     }, 1500);
-    return () => window.clearInterval(timer);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [pairing, pairStatus?.state, token, onDeviceAdded]);
 
   useEffect(() => {

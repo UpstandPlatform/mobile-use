@@ -185,6 +185,12 @@ func (m *Manager) Execute(ctx context.Context, command wire.Dispatch) wire.Resul
 		result.Fault = wire.Public(err)
 		return result
 	}
+	// Sessions start at generation 1. A generation-0 command would match a fresh worker's zero
+	// state without initializing its frame map, so observe would write to a nil map.
+	if command.Generation < 1 || command.SessionID == "" {
+		result.Fault = wire.ErrExpired
+		return result
+	}
 	now := time.Now()
 	maxLifetime := 11 * time.Second
 	if command.Operation.IsAppMaintenance() && !command.Personal {

@@ -83,6 +83,12 @@ class ScreenShareService : Service() {
         val permission = intent?.getParcelableExtra(PERMISSION, Intent::class.java)
         val pairing = PairingStore(this).read()
         if (id == null || permission == null || pairing == null) {
+            // start() uses startForegroundService(), so the service must still enter the
+            // foreground before stopping or the system raises ForegroundServiceDidNotStartInTime.
+            // A media-projection type can be refused without a consent token; stop either way.
+            runCatching {
+                startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            }
             stopSelf()
             return START_NOT_STICKY
         }

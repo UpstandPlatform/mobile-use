@@ -73,6 +73,13 @@ func (b backendFlags) backends() ([]connector.Backend, error) {
 		backends = append(backends, connector.Android{ADB: *b.adb, UseHelper: *b.androidHelper, ScrcpyServer: *b.scrcpyServer, Catalog: catalog})
 	}
 	if *b.appium != "" || *b.ios != "" {
+		// The iOS backend needs both: Appium drives the devices listed in the config file.
+		if *b.ios == "" {
+			return nil, fmt.Errorf("--appium requires --ios-config with the allowed iOS devices")
+		}
+		if *b.appium == "" {
+			return nil, fmt.Errorf("--ios-config requires --appium with the loopback Appium URL")
+		}
 		data, err := os.ReadFile(*b.ios)
 		if err != nil {
 			return nil, err
@@ -292,7 +299,6 @@ func serve(parent context.Context, args []string, upMode bool) error {
 		return err
 	}
 	svc.Video = video
-	go svc.Maintain(ctx)
 
 	var companionServer *http.Server
 	var companion *service.Companion
@@ -390,6 +396,9 @@ func serve(parent context.Context, args []string, upMode bool) error {
 		}
 	}
 
+	// Start expiry sweeps only after hub.Companion is final; Maintain reads it via Hub.Stop.
+	go svc.Maintain(ctx)
+
 	tickets := &ticketStore{}
 	extra := func(router *http.ServeMux) {
 		if companion != nil {
@@ -402,7 +411,7 @@ func serve(parent context.Context, args []string, upMode bool) error {
 			router.Handle("POST /v1/auth/launch-ticket", auth.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				actor, _ := service.ActorFrom(r.Context())
 				if !actor.CanManage() {
-					w.WriteHeader(http.StatusForbidden)
+					writeFault(w, wire.ErrForbidden)
 					return
 				}
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -414,7 +423,7 @@ func serve(parent context.Context, args []string, upMode bool) error {
 					hostPart = r.RemoteAddr
 				}
 				if !loopback(hostPart) {
-					w.WriteHeader(http.StatusForbidden)
+					writeFault(w, wire.ErrForbidden)
 					return
 				}
 				defer r.Body.Close()
@@ -437,7 +446,7 @@ func serve(parent context.Context, args []string, upMode bool) error {
 				router.Handle("GET /v1/local/adb/discover", auth.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					actor, _ := service.ActorFrom(r.Context())
 					if !actor.CanManage() {
-						w.WriteHeader(http.StatusForbidden)
+						writeFault(w, wire.ErrForbidden)
 						return
 					}
 					probe, stop := context.WithTimeout(r.Context(), 4*time.Second)
@@ -462,7 +471,7 @@ func serve(parent context.Context, args []string, upMode bool) error {
 				router.Handle("POST /v1/local/adb/pair", auth.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					actor, _ := service.ActorFrom(r.Context())
 					if !actor.CanManage() {
-						w.WriteHeader(http.StatusForbidden)
+						writeFault(w, wire.ErrForbidden)
 						return
 					}
 					defer r.Body.Close()
@@ -471,15 +480,12 @@ func serve(parent context.Context, args []string, upMode bool) error {
 						Code    string `json:"code"`
 					}
 					if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-						w.WriteHeader(http.StatusBadRequest)
+						writeFault(w, errInvalidJSON)
 						return
 					}
 					msg, err := android.PairWireless(r.Context(), req.Address, req.Code)
 					if err != nil {
-						fault := wire.Public(err)
-						w.Header().Set("Content-Type", "application/json; charset=utf-8")
-						w.WriteHeader(fault.Status)
-						_, _ = w.Write([]byte(wire.Marshal(map[string]any{"error": fault})))
+						writeFault(w, wire.Public(err))
 						return
 					}
 					w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -488,7 +494,7 @@ func serve(parent context.Context, args []string, upMode bool) error {
 				router.Handle("POST /v1/local/adb/connect", auth.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					actor, _ := service.ActorFrom(r.Context())
 					if !actor.CanManage() {
-						w.WriteHeader(http.StatusForbidden)
+						writeFault(w, wire.ErrForbidden)
 						return
 					}
 					defer r.Body.Close()
@@ -496,15 +502,12 @@ func serve(parent context.Context, args []string, upMode bool) error {
 						Address string `json:"address"`
 					}
 					if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-						w.WriteHeader(http.StatusBadRequest)
+						writeFault(w, errInvalidJSON)
 						return
 					}
 					msg, err := android.ConnectWireless(r.Context(), req.Address)
 					if err != nil {
-						fault := wire.Public(err)
-						w.Header().Set("Content-Type", "application/json; charset=utf-8")
-						w.WriteHeader(fault.Status)
-						_, _ = w.Write([]byte(wire.Marshal(map[string]any{"error": fault})))
+						writeFault(w, wire.Public(err))
 						return
 					}
 					if hub.Local != nil {
@@ -649,9 +652,26 @@ func parseConnectorMap(raw string) (map[string]string, error) {
 		if !ok || !wire.ValidID(name) || !wire.ValidID(space) || name == "local" || result[name] != "" {
 			return nil, fmt.Errorf("invalid connector allowlist")
 		}
+		// Hub.Dispatch and Hub.Stop route every "companion." target to the Wi-Fi companion.
+		if strings.HasPrefix(name, "companion.") {
+			return nil, fmt.Errorf("connector name %q is reserved: names starting with \"companion.\" belong to the Wi-Fi companion", name)
+		}
 		result[name] = space
 	}
 	return result, nil
+}
+
+var errInvalidJSON = wire.Error("INVALID_JSON", "Send one valid JSON object for this operation.", http.StatusBadRequest)
+
+// writeFault writes the API's standard {"error":{"code","message"}} body.
+func writeFault(w http.ResponseWriter, fault *wire.Fault) {
+	status := fault.Status
+	if status == 0 {
+		status = http.StatusInternalServerError
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(wire.Marshal(map[string]any{"error": fault})))
 }
 
 func localInventory(ctx context.Context, db *store.Store, manager *connector.Manager) {

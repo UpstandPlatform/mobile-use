@@ -382,3 +382,54 @@ func TestCompanionPairingUploadAndRevocation(t *testing.T) {
 	request[map[string]bool](t, f.owner, "DELETE", "/v1/companion/"+id, nil)
 	phonePost(t, f.origin, token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), 403)
 }
+
+func TestAgentApprovedAppMaintenanceRequiresDedicatedDeviceGrant(t *testing.T) {
+	f := setup(t)
+	admin := request[wire.Actor](t, f.owner, "GET", "/v1/me", nil)
+	capabilities := wire.Capabilities{
+		wire.Screen: true, wire.Tree: true, wire.Touch: true, wire.Text: true,
+		wire.Apps: true, wire.Browser: true, wire.AppManagement: true,
+	}
+	catalog := []wire.CatalogItem{{ID: "fixture-app", Label: "Fixture app", AppID: "org.fixture.app"}}
+	if err := f.db.Register(t.Context(), admin.Workspace, "local", []wire.Inventory{{
+		ID: f.device, Label: "Maintenance fixture", Platform: "android", Mode: "adb",
+		Capabilities: capabilities, Catalog: catalog,
+	}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	baseCaps := []wire.Capability{wire.Apps, wire.Touch}
+	enroll(t, f, f.device, wire.Dedicated, baseCaps)
+	withoutCatalog := request[[]wire.Device](t, f.agent, "GET", "/v1/devices", nil)
+	if len(withoutCatalog) != 1 || len(withoutCatalog[0].Catalog) != 0 {
+		t.Fatalf("APK catalog was visible without the app_management grant: %+v", withoutCatalog)
+	}
+	withoutGrant := request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{
+		DeviceID: f.device, Purpose: "Verify app maintenance grants", Capabilities: baseCaps,
+	})
+	op := wire.Operation{ID: "install-without-grant", Kind: "app_install", Maintenance: &wire.Maintenance{ArtifactID: "fixture-app", Confirm: "install fixture-app"}}
+	agentActor := wire.Actor{Workspace: admin.Workspace, Subject: "agent", Role: wire.Agent}
+	if _, err := f.db.BeginOperation(t.Context(), agentActor, withoutGrant.ID, op, "digest-without-grant", time.Now()); wire.Public(err).Code != wire.ErrForbidden.Code {
+		t.Fatalf("agent without app_management grant was allowed: %v", err)
+	}
+
+	grantedCaps := []wire.Capability{wire.Apps, wire.Touch, wire.AppManagement}
+	enroll(t, f, f.device, wire.Dedicated, grantedCaps)
+	devices := request[[]wire.Device](t, f.agent, "GET", "/v1/devices", nil)
+	if len(devices) != 1 || len(devices[0].Catalog) != 1 || devices[0].Catalog[0].ID != "fixture-app" {
+		t.Fatalf("approved APK catalog was not visible with its device grant: %+v", devices)
+	}
+	withGrant := request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{
+		DeviceID: f.device, Purpose: "Verify approved APK install", Capabilities: grantedCaps,
+	})
+	op.ID = "install-with-grant"
+	ticket, err := f.db.BeginOperation(t.Context(), agentActor, withGrant.ID, op, "digest-with-grant", time.Now())
+	if err != nil {
+		t.Fatalf("agent with dedicated app_management grant could not begin installation: %v", err)
+	}
+	if ticket.Dispatch.Operation.Kind != "app_install" || ticket.Dispatch.Operation.Maintenance.ArtifactID != "fixture-app" || ticket.Dispatch.Personal != (withGrant.Profile == wire.Personal) {
+		t.Fatalf("unexpected app install dispatch: %+v", ticket.Dispatch)
+	}
+	if err := f.db.FinishOperation(t.Context(), agentActor, ticket.Target, wire.Result{ID: op.ID, State: wire.Failed, Fault: wire.ErrUnsupported}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}

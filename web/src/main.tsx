@@ -201,8 +201,8 @@ function App() {
           <div className="section-heading"><div><h2>{device.label}</h2><span>{device.platform === 'ios' ? 'iOS' : 'Android'} · {device.connector || device.mode}</span></div><Badge tone={device.online ? 'green' : 'neutral'}>{device.online ? 'Online' : 'Offline'}</Badge></div>
           <div className="detail-body">
             {deviceSessions.length > 0 && <SessionList sessions={deviceSessions} devices={devices} actor={actor} busy={busy} change={change} selectedDevice={device.id} />}
-            {active && <Viewer key={`${active.id}:${active.controller}`} token={token} actor={actor} session={active} supportsVideo={device.live_video} supportsNavKeys={device.mode !== 'companion'} captureRevision={captureRevision} onError={setError} />}
-            {manage && active?.controller === actor.subject && device.profile === 'dedicated' && !!device.catalog?.length && active.capabilities.includes('apps') && active.capabilities.includes('touch') && !active.paused &&
+            {active && <Viewer key={`${active.id}:${active.controller}`} token={token} actor={actor} session={active} supportsVideo={device.live_video} supportsNavKeys={device.mode !== 'companion'} supportsFrameStream={device.mode === 'companion'} captureRevision={captureRevision} onError={setError} />}
+            {manage && active?.controller === actor.subject && device.profile === 'dedicated' && !!device.catalog?.length && active.capabilities.includes('apps') && active.capabilities.includes('touch') && active.capabilities.includes('app_management') && !active.paused &&
               <MaintenanceForm key={active.id} device={device} token={token} session={active} onAttempt={() => setCaptureRevision(value => value + 1)} />}
             {device.enabled && device.online && !active && actor.role !== 'auditor' && <StartForm key={`start-${device.id}`} device={device} busy={busy} submit={body => run(() => api(token, '/v1/sessions', 'POST', body))} />}
             {manage && <EnrollmentForm key={device.id} actor={actor} device={device} busy={busy} submit={body => run(() => api(token, `/v1/devices/${device.id}`, 'PUT', body))} onUnpair={device.mode === 'companion' ? () => run(() => api(token, `/v1/companion/${device.id}`, 'DELETE')) : undefined} />}
@@ -210,7 +210,7 @@ function App() {
           </div>
         </section>}
       </div>}
-      {tab === 'Sessions' && <section className="surface detail"><SessionList sessions={sessions} devices={devices} actor={actor} busy={busy} change={change} /><div className="detail-body">{sessions.filter(item => item.state === 'active').map(item => <Viewer key={item.id} token={token} actor={actor} session={item} supportsVideo={devices.some(device => device.id === item.device_id && device.live_video)} supportsNavKeys={devices.some(device => device.id === item.device_id && device.mode !== 'companion')} onError={setError} />)}</div></section>}
+      {tab === 'Sessions' && <section className="surface detail"><SessionList sessions={sessions} devices={devices} actor={actor} busy={busy} change={change} /><div className="detail-body">{sessions.filter(item => item.state === 'active').map(item => <Viewer key={item.id} token={token} actor={actor} session={item} supportsVideo={devices.some(device => device.id === item.device_id && device.live_video)} supportsNavKeys={devices.some(device => device.id === item.device_id && device.mode !== 'companion')} supportsFrameStream={devices.some(device => device.id === item.device_id && device.mode === 'companion')} onError={setError} />)}</div></section>}
       {tab === 'MCP & Agents' && <McpSetup devices={devices} systemInfo={systemInfo} onSelectDevice={id => { setSelected(id); setTab('Devices'); }} />}
       {tab === 'Audit' && <section className="surface audit"><table><caption className="sr-only">Workspace audit events</caption><thead><tr><th>Time</th><th>Event</th><th>Identity</th><th>Result</th></tr></thead><tbody>{audits.map((item, index) => <tr key={`${item.at}-${index}`}><td>{new Date(item.at).toLocaleString()}</td><td>{item.event.replaceAll('_', ' ')}</td><td>{item.actor}</td><td>{item.code?.replaceAll('_', ' ') || '—'}</td></tr>)}</tbody></table>{audits.length === 0 && <p className="empty">No audit events yet.</p>}</section>}
     </main>
@@ -396,12 +396,15 @@ function MaintenanceForm({ device, token, session, onAttempt }: { device: Device
   </details>;
 }
 
-function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, captureRevision, onError }: { token: string; actor: Actor; session: Session; supportsVideo: boolean; supportsNavKeys?: boolean; captureRevision?: number; onError: (message: string) => void }) {
+function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, supportsFrameStream, captureRevision, onError }: { token: string; actor: Actor; session: Session; supportsVideo: boolean; supportsNavKeys?: boolean; supportsFrameStream?: boolean; captureRevision?: number; onError: (message: string) => void }) {
   const [frame, setFrame] = useState<Observation>();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
-  const [preview, setPreview] = useState(false);
+  const [preview, setPreview] = useState(Boolean(supportsFrameStream));
+  const [streamState, setStreamState] = useState<'idle' | 'connecting' | 'waiting' | 'streaming' | 'reconnecting' | 'error'>('idle');
+  const [streamMessage, setStreamMessage] = useState('');
   const [live, setLive] = useState(false);
+  const [pageVisible, setPageVisible] = useState(() => !document.hidden);
   const start = useRef<{ x: number; y: number } | undefined>(undefined);
   const base = `/v1/sessions/${session.id}`;
   const owner = session.owner === actor.subject && actor.role !== 'agent';
@@ -419,6 +422,86 @@ function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, capture
   }, [token, base]);
 
   useEffect(() => {
+    const updateVisibility = () => setPageVisible(!document.hidden);
+    document.addEventListener('visibilitychange', updateVisibility);
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (!supportsFrameStream || !preview || !pageVisible || session.paused) {
+      setStreamState('idle');
+      setStreamMessage('');
+      return;
+    }
+    const abort = new AbortController();
+    let closed = false;
+    let retryDelay = 500;
+    const connect = async () => {
+      while (!closed) {
+        try {
+          setStreamMessage('');
+          setStreamState(current => current === 'streaming' ? current : 'connecting');
+          const response = await fetch(`/v1/companion/sessions/${session.id}/frames`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+            signal: abort.signal,
+            redirect: 'error',
+          });
+          if (!response.ok || !response.body) {
+            const failure = await response.json().catch(() => undefined) as { error?: { message?: string } } | undefined;
+            const message = failure?.error?.message || `Screen stream unavailable (${response.status}).`;
+            if ([401, 403, 404, 409].includes(response.status)) {
+              setStreamMessage(message);
+              setStreamState('error');
+              return;
+            }
+            throw new Error(message);
+          }
+          setStreamState('waiting');
+          retryDelay = 500;
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          while (!closed) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const block = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              let event = 'message';
+              const data: string[] = [];
+              for (const line of block.split('\n')) {
+                if (line.startsWith('event:')) event = line.slice(6).trim();
+                else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+              }
+              if (data.length) {
+                if (event === 'frame') {
+                  const next = JSON.parse(data.join('\n')) as Observation;
+                  if (next.image) setFrame(next);
+                  setStreamState('streaming');
+                } else if (event === 'status') {
+                  setStreamState('waiting');
+                }
+              }
+              boundary = buffer.indexOf('\n\n');
+            }
+          }
+          if (!closed) throw new Error('The companion screen stream disconnected.');
+        } catch (error) {
+          if (closed || abort.signal.aborted) return;
+          setStreamMessage(errorText(error));
+          setStreamState('reconnecting');
+          await new Promise(resolve => window.setTimeout(resolve, retryDelay));
+          retryDelay = Math.min(3000, retryDelay * 2);
+        }
+      }
+    };
+    void connect();
+    return () => { closed = true; abort.abort(); };
+  }, [pageVisible, preview, session.id, session.paused, supportsFrameStream, token]);
+
+  useEffect(() => {
     if (!owner || session.profile !== 'personal') return;
     const presence = () => { if (!document.hidden) api(token, `${base}/presence`, 'POST').catch(() => undefined); };
     presence();
@@ -428,7 +511,7 @@ function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, capture
   }, [base, owner, session.profile, token]);
 
   useEffect(() => {
-    if (!preview || busy || controller || live || session.paused) return;
+    if (supportsFrameStream || !preview || !pageVisible || busy || controller || live || session.paused) return;
     let closed = false;
     let timer = 0;
     const update = async () => {
@@ -440,12 +523,12 @@ function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, capture
       } catch {
         // An agent can temporarily occupy the device worker. The next refresh retries observation.
       } finally {
-        if (!closed) timer = window.setTimeout(update, 2500);
+        if (!closed) timer = window.setTimeout(update, 1000);
       }
     };
     void update();
     return () => { closed = true; window.clearTimeout(timer); };
-  }, [preview, busy, controller, live, session.paused, observe]);
+  }, [pageVisible, preview, busy, controller, live, session.paused, supportsFrameStream, observe]);
 
   useEffect(() => { if (session.paused || !supportsVideo) setLive(false); }, [session.paused, supportsVideo]);
 
@@ -474,11 +557,25 @@ function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, capture
   };
 
   const show = session.capabilities.includes('screen') && (owner || session.requester === actor.subject || controller);
+  const streamDescription = session.paused && supportsFrameStream
+    ? frame ? `Session paused · last frame at ${time(frame.captured_at)}` : 'Screen sharing is paused'
+    : !preview && supportsFrameStream
+      ? 'Companion stream paused'
+    : frame
+    ? supportsFrameStream
+      ? streamState === 'streaming'
+        ? `Live · Updated at ${time(frame.captured_at)}`
+        : `Last frame at ${time(frame.captured_at)} · ${streamState === 'error' ? streamMessage : streamState === 'waiting' ? 'waiting for the next frame' : 'reconnecting to the companion'}`
+      : `Updated at ${time(frame.captured_at)}`
+    : supportsFrameStream
+      ? streamState === 'error' ? streamMessage : streamState === 'reconnecting' ? 'Reconnecting to the companion…' : streamState === 'connecting' ? 'Connecting to the companion…' : 'Waiting for screen sharing on the phone'
+      : `Controlled by ${session.controller}`;
+  const streamEmptyText = !preview ? 'Screen stream is paused.' : streamState === 'error' ? streamMessage : streamState === 'reconnecting' ? 'Reconnecting to the companion…' : 'Start “Share screen” in the companion app. New frames appear here automatically.';
   if (!show) return null;
   return <section className="viewer" aria-label="Phone screen">
-    <div className="viewer-header"><div><h3>Phone screen</h3><p>{frame ? `Captured at ${time(frame.captured_at)}` : `Controlled by ${session.controller}`}</p></div><div className="actions">
+    <div className="viewer-header"><div><h3>Phone screen</h3><p>{streamDescription}</p></div><div className="actions">
       {supportsVideo && !session.paused && <button type="button" aria-pressed={live} onClick={() => setLive(value => !value)}>{live ? 'Stop live video' : 'Live video'}</button>}
-      {!live && !controller && !session.paused && <button type="button" aria-pressed={preview} onClick={() => setPreview(value => !value)}>{preview ? 'Pause preview' : 'Auto-refresh'}</button>}
+      {!live && !controller && !session.paused && <button type="button" aria-pressed={preview} onClick={() => setPreview(value => !value)}>{preview ? supportsFrameStream ? 'Pause stream' : 'Pause preview' : supportsFrameStream ? 'Resume stream' : 'Auto-refresh'}</button>}
       {!live && <button type="button" onClick={() => perform()} disabled={busy}>{busy ? 'Working…' : 'Capture screen'}</button>}
     </div></div>
     <div className="viewer-screen">{live && !session.paused ? <LiveVideo token={token} path={`${base}/video`} /> : frame?.image ? <img draggable="false" alt="Latest authorized screenshot of the phone" className={controller ? 'interactive' : ''} src={`data:${frame.image.mime};base64,${frame.image.data}`}
@@ -491,7 +588,7 @@ function Viewer({ token, actor, session, supportsVideo, supportsNavKeys, capture
         const end = position(event);
         if (Math.hypot(point.x - end.x, point.y - end.y) > 0.04) perform({ type: 'swipe', point, end });
         else perform({ type: 'tap', point });
-      }} /> : <div className="screen-empty"><PhoneMark /><span>Capture a screen to inspect the session.</span></div>}</div>
+      }} /> : <div className="screen-empty"><PhoneMark /><span>{supportsFrameStream ? session.paused ? 'Screen sharing is paused.' : streamEmptyText : 'Capture a screen to inspect the session.'}</span></div>}</div>
     {controller && frame && !live && <div className="viewer-keys">
       <button type="button" onClick={() => perform({ type: 'key', key: 'home' })} disabled={busy}>Home</button>
       {supportsNavKeys && <button type="button" onClick={() => perform({ type: 'key', key: 'back' })} disabled={busy}>Back</button>}

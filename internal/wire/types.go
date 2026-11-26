@@ -50,15 +50,16 @@ var (
 type Capability string
 
 const (
-	Screen     Capability = "screen"
-	Tree       Capability = "ui_tree"
-	Touch      Capability = "touch"
-	Text       Capability = "text"
-	Apps       Capability = "apps"
-	Browser    Capability = "browser"
-	Camera     Capability = "camera"
-	Microphone Capability = "microphone"
-	MultiTouch Capability = "multi_touch"
+	Screen        Capability = "screen"
+	Tree          Capability = "ui_tree"
+	Touch         Capability = "touch"
+	Text          Capability = "text"
+	Apps          Capability = "apps"
+	Browser       Capability = "browser"
+	Camera        Capability = "camera"
+	Microphone    Capability = "microphone"
+	MultiTouch    Capability = "multi_touch"
+	AppManagement Capability = "app_management"
 )
 
 type Capabilities map[Capability]bool
@@ -353,7 +354,7 @@ var opaqueID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.:@-]{0,127}$`)
 func ValidID(value string) bool { return opaqueID.MatchString(value) }
 
 func ValidCapability(value Capability) bool {
-	return slices.Contains([]Capability{Screen, Tree, Touch, Text, Apps, Browser, Camera, Microphone, MultiTouch}, value)
+	return slices.Contains([]Capability{Screen, Tree, Touch, Text, Apps, Browser, Camera, Microphone, MultiTouch, AppManagement}, value)
 }
 
 func Marshal(v any) string {
@@ -435,7 +436,7 @@ func (op Operation) Required() ([]Capability, error) {
 		if request == nil || !ValidID(request.ArtifactID) || request.Confirm != verb+" "+request.ArtifactID {
 			return nil, Error("MAINTENANCE_CONFIRMATION", "Confirm the named maintenance operation before dispatch.", 400)
 		}
-		return []Capability{Apps, Touch}, nil
+		return []Capability{Apps, Touch, AppManagement}, nil
 	case "browser_contexts":
 		return []Capability{Browser}, nil
 	case "sensor_request", "sensor_status", "artifact_get":

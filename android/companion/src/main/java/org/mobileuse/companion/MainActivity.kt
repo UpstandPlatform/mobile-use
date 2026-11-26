@@ -285,6 +285,8 @@ class MainActivity : ComponentActivity() {
         micRequest = null
         micJob?.cancel()
         ScreenShareService.stop(this)
+        Sharing.error.value = null
+        Sharing.lastFrameAt.value = null
         lifecycleScope.launch {
             try {
                 withContext(Dispatchers.IO) { CompanionApi(current).session(id, "end") }
@@ -331,6 +333,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun CompanionUI() {
         val sharing by Sharing.session.collectAsState()
+        val sharingError by Sharing.error.collectAsState()
+        val lastFrameAt by Sharing.lastFrameAt.collectAsState()
         val discoveredHosts by lanDiscovery.hosts.collectAsState()
         var origin by rememberSaveable { mutableStateOf("") }
         var code by remember { mutableStateOf("") }
@@ -597,7 +601,19 @@ class MainActivity : ComponentActivity() {
                                         Button(enabled = online && !busy, onClick = { execute { it.session(item.id, "approve"); withContext(Dispatchers.Main) { attending = item.id } } }) { Text("Approve") }
                                         TextButton(enabled = online && !busy, onClick = { execute { it.session(item.id, "deny") } }) { Text("Deny") }
                                     } else if (item.state == "active") {
-                                        if (sharing == item.id) Text("Sharing screen", color = colors.primary, style = MaterialTheme.typography.labelLarge)
+                                        if (sharing == item.id) {
+                                            Text(
+                                                if (lastFrameAt == null) "Screen sharing is on · waiting for first frame…" else "Screen frames are sending",
+                                                color = colors.primary,
+                                                style = MaterialTheme.typography.labelLarge,
+                                            )
+                                        }
+                                        if (!sharingError.isNullOrBlank()) Text(
+                                            sharingError.orEmpty(),
+                                            color = colors.error,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                                        )
                                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                             if (sharing != item.id && "screen" in item.caps) Button(enabled = online && !busy, onClick = { share(item.id) }) { Text("Share screen") }
                                             OutlinedButton(onClick = { stopSession(item.id) }) { Text("Stop", color = colors.error) }

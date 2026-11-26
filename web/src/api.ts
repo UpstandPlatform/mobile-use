@@ -104,6 +104,7 @@ export async function exchangeLaunchTicket(ticket: string): Promise<string> {
 export const labels: Record<string, string> = {
   screen: 'Screen', ui_tree: 'UI tree', touch: 'Touch', text: 'Text input', apps: 'Installed apps',
   browser: 'Browser', camera: 'Camera', microphone: 'Microphone', multi_touch: 'Multi-touch',
+  app_management: 'Approved app install/reset',
 };
 
 export async function api<T>(token: string, path: string, method = 'GET', body?: unknown): Promise<T> {

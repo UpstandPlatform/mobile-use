@@ -255,7 +255,9 @@ func (s *Store) Devices(ctx context.Context, actor wire.Actor, now time.Time) ([
 				continue
 			}
 			d.Grants, d.Connector, d.Owner = nil, "", ""
-			d.Catalog = nil
+			if d.Profile != wire.Dedicated || !slices.Contains(grant.Capabilities, wire.AppManagement) {
+				d.Catalog = nil
+			}
 			caps := make(wire.Capabilities, len(grant.Capabilities))
 			for _, cap := range grant.Capabilities {
 				caps[cap] = d.Capabilities[cap]
@@ -662,7 +664,12 @@ func (s *Store) BeginOperation(ctx context.Context, actor wire.Actor, id string,
 			return wire.ErrExpired
 		}
 		if op.IsAppMaintenance() {
-			if !actor.CanManage() || session.Profile != wire.Dedicated {
+			allowed := actor.CanManage() && session.Profile == wire.Dedicated
+			if actor.Role == wire.Agent && session.Profile == wire.Dedicated {
+				grant := deviceGrant(d.Device, actor.Subject)
+				allowed = grant != nil && slices.Contains(grant.Capabilities, wire.AppManagement)
+			}
+			if !allowed {
 				return wire.ErrForbidden
 			}
 			if !slices.ContainsFunc(d.Catalog, func(item wire.CatalogItem) bool { return item.ID == op.Maintenance.ArtifactID }) {

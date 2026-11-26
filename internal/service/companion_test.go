@@ -1,12 +1,18 @@
 package service_test
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"mobile-use/internal/service"
 	"mobile-use/internal/store"
@@ -140,5 +146,88 @@ func TestCompanionMultiOriginPhoneHandlerAndRateLimit(t *testing.T) {
 	handler.ServeHTTP(w16, r16)
 	if w16.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 RATE_LIMITED on 16th attempt, got %d", w16.Code)
+	}
+}
+
+func TestCompanionFrameStreamPushesFramesWithoutPollingOperations(t *testing.T) {
+	f := setup(t)
+	code := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", nil)["code"].(string)
+	var enrolled map[string]string
+	opening := []byte(wire.Marshal(map[string]string{"code": code, "label": "Streaming phone"}))
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, 201), &enrolled); err != nil {
+		t.Fatal(err)
+	}
+	token, deviceID := enrolled["token"], enrolled["device_id"]
+	phonePost(t, f.origin, token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), 200)
+	caps := []wire.Capability{wire.Screen, wire.Camera, wire.Microphone}
+	enroll(t, f, deviceID, wire.Personal, caps)
+	session := request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{DeviceID: deviceID, Purpose: "Verify pushed screen frames", Capabilities: caps})
+	phonePost(t, f.origin, token, "/companion/sessions/"+session.ID+"/approve", "application/json", []byte(`{}`), 200)
+
+	deniedReq, err := http.NewRequest(http.MethodGet, f.origin+"/v1/companion/sessions/"+session.ID+"/frames", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedReq.Header.Set("Authorization", "Bearer other-workspace-test-token")
+	deniedResp, err := http.DefaultClient.Do(deniedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedResp.Body.Close()
+	if deniedResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-workspace frame stream returned %d, want 404", deniedResp.StatusCode)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.origin+"/v1/companion/sessions/"+session.ID+"/frames", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tokenAgent)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("frame stream returned %d (%q)", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	reader := bufio.NewReader(resp.Body)
+	if waiting := readSSEBlock(t, reader); !strings.Contains(waiting, "event: status") || !strings.Contains(waiting, `"state":"waiting"`) {
+		t.Fatalf("stream did not report its initial waiting state: %q", waiting)
+	}
+
+	var picture bytes.Buffer
+	if err := jpeg.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 80, 120)), nil); err != nil {
+		t.Fatal(err)
+	}
+	phonePost(t, f.origin, token, "/companion/sessions/"+session.ID+"/frame", "image/jpeg", picture.Bytes(), 204)
+	frame := readSSEBlock(t, reader)
+	if !strings.Contains(frame, "event: frame") || !strings.Contains(frame, `"image":{"mime":"image/jpeg","data":"`) {
+		t.Fatalf("stream did not push the uploaded JPEG: %q", frame)
+	}
+
+	// Confirm a second frame is pushed independently of the operation endpoint.
+	time.Sleep(210 * time.Millisecond)
+	phonePost(t, f.origin, token, "/companion/sessions/"+session.ID+"/frame", "image/jpeg", picture.Bytes(), 204)
+	second := readSSEBlock(t, reader)
+	if !strings.Contains(second, "event: frame") || !strings.Contains(second, `"frame_id"`) {
+		t.Fatalf("stream did not push a subsequent frame: %q", second)
+	}
+}
+
+func readSSEBlock(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	var block strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		block.WriteString(line)
+		if strings.TrimSpace(line) == "" {
+			return block.String()
+		}
 	}
 }

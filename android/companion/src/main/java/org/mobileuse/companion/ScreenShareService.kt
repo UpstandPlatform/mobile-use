@@ -28,6 +28,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 
 object Sharing {
     val session = MutableStateFlow<String?>(null)
+    val error = MutableStateFlow<String?>(null)
+    val lastFrameAt = MutableStateFlow<Long?>(null)
 }
 
 class ScreenShareService : Service() {
@@ -44,10 +46,22 @@ class ScreenShareService : Service() {
     private var api: CompanionApi? = null
     private var lastFrame = 0L
     private var lastSuccess = 0L
+    private var startedAt = 0L
     private val heartbeat = object : Runnable {
         override fun run() {
             if (closing.get()) return
-            if (SystemClock.elapsedRealtime() - lastSuccess > 9500L) { stopSelf(); return }
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastSuccess > 9500L) {
+                Sharing.error.value = "Screen sharing stopped because the phone lost contact with the server. Check Wi-Fi and start sharing again."
+                stopSelf()
+                return
+            }
+            val frameAt = Sharing.lastFrameAt.value
+            if (frameAt == null && now - startedAt > 10000L) {
+                Sharing.error.value = "Android has not produced a screen frame yet. Stop sharing and approve the screen prompt again."
+            } else if (frameAt != null && now - frameAt > 10000L) {
+                Sharing.error.value = "Screen frames stopped reaching the server. Check Wi-Fi, then restart screen sharing."
+            }
             val id = sessionId
             val client = api
             if (id != null && client != null && checking.compareAndSet(false, true)) {
@@ -57,8 +71,10 @@ class ScreenShareService : Service() {
                         if (current.sessions.none { it.id == id && it.state == "active" }) stopSelf()
                         else captureHandler.post { lastSuccess = SystemClock.elapsedRealtime() }
                     } catch (error: ApiFailure) {
+                        Sharing.error.value = error.message
                         if (error.status in setOf(401, 403, 404, 409)) stopSelf()
-                    } catch (_: Exception) {
+                    } catch (error: Exception) {
+                        Sharing.error.value = error.message ?: "The phone could not check its screen-sharing session."
                         // The watchdog stops projection after losing backend presence.
                     } finally { checking.set(false) }
                 }
@@ -96,6 +112,9 @@ class ScreenShareService : Service() {
         sessionId = id
         api = CompanionApi(pairing)
         lastSuccess = SystemClock.elapsedRealtime()
+        startedAt = lastSuccess
+        Sharing.error.value = null
+        Sharing.lastFrameAt.value = null
         try {
             val manager = getSystemService(MediaProjectionManager::class.java)
             projection = manager.getMediaProjection(intent.getIntExtra(RESULT, 0), permission)
@@ -106,7 +125,12 @@ class ScreenShareService : Service() {
                 }
             }, captureHandler)
             val bounds = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
-            captureHandler.post { runCatching { configure(bounds.width(), bounds.height()) }.onFailure { stopSelf() } }
+            captureHandler.post {
+                runCatching { configure(bounds.width(), bounds.height()) }.onFailure {
+                    Sharing.error.value = "Android could not start screen capture. Stop sharing and approve the screen prompt again."
+                    stopSelf()
+                }
+            }
             captureHandler.postDelayed(heartbeat, 2000)
             Sharing.session.value = id
         } catch (_: RuntimeException) {
@@ -143,7 +167,7 @@ class ScreenShareService : Service() {
         image.use { frame ->
             val now = SystemClock.elapsedRealtime()
             if (now - lastSuccess > 9500L) { stopSelf(); return }
-            if (now - lastFrame < 800L || !uploading.compareAndSet(false, true)) return
+            if (now - lastFrame < 250L || !uploading.compareAndSet(false, true)) return
             lastFrame = now
             val id = sessionId
             val client = api
@@ -158,16 +182,27 @@ class ScreenShareService : Service() {
                     finally { if (crop !== bitmap) crop.recycle() }
                 } finally { bitmap.recycle() }
             }.getOrNull()
-            if (bytes == null) { uploading.set(false); return }
+            if (bytes == null) {
+                Sharing.error.value = "The phone could not encode a screen frame. Restart screen sharing and try again."
+                uploading.set(false)
+                return
+            }
             transfer.submit {
                 try {
                     if (!closing.get()) {
                         client.frame(id, bytes)
-                        captureHandler.post { lastSuccess = SystemClock.elapsedRealtime() }
+                        captureHandler.post {
+                            val uploadedAt = SystemClock.elapsedRealtime()
+                            lastSuccess = uploadedAt
+                            Sharing.lastFrameAt.value = uploadedAt
+                            Sharing.error.value = null
+                        }
                     }
                 } catch (error: ApiFailure) {
+                    Sharing.error.value = error.message
                     if (error.status in setOf(401, 403, 404, 409)) stopSelf()
-                } catch (_: Exception) {
+                } catch (error: Exception) {
+                    Sharing.error.value = error.message ?: "The phone could not send a screen frame. Check Wi-Fi and the server address."
                     // The capture watchdog stops sharing if the server remains unreachable.
                 } finally { uploading.set(false) }
             }
@@ -200,6 +235,7 @@ class ScreenShareService : Service() {
             captureThread.quitSafely()
         }
         Sharing.session.value = null
+        Sharing.lastFrameAt.value = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

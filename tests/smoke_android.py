@@ -175,13 +175,17 @@ def verify_maintenance(request, emulator):
         maintenance(base, "agent", "reset", expected=403)
     finally:
         request("admin", base + "/end", "POST")
-    base = start("admin")
+
+    capabilities.append("app_management")
+    enrollment["grants"][0]["capabilities"] = capabilities
+    request("admin", path, "PUT", enrollment)
+    base = start("agent")
     try:
-        maintenance(base, "admin", "install", confirmed=False, expected=400)
+        maintenance(base, "agent", "install", confirmed=False, expected=400)
         for verb in ("install", "reset"):
-            result = maintenance(base, "admin", verb)
+            result = maintenance(base, "agent", verb)
             assert result["state"] == "succeeded", result.get("error")
-        result = request("admin", base + "/operations", "POST", {"kind": "apps_list"})
+        result = request("agent", base + "/operations", "POST", {"kind": "apps_list"})
         assert package in result.get("apps", []), result
     finally:
         request("admin", base + "/end", "POST")

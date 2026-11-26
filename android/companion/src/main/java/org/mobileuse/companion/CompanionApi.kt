@@ -62,8 +62,9 @@ class CompanionApi(private val pairing: Pairing) {
             connection.setFixedLengthStreamingMode(data.size)
             connection.outputStream.use { it.write(data) }
             val status = connection.responseCode
-            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.use { input -> input.readNBytes(128 * 1024).toString(Charsets.UTF_8) }.orEmpty()
+            val body = if (status == HttpsURLConnection.HTTP_NO_CONTENT) ""
+                else (if (status in 200..299) connection.inputStream else connection.errorStream)
+                    ?.use { input -> input.readNBytes(128 * 1024).toString(Charsets.UTF_8) }.orEmpty()
             if (status !in 200..299) {
                 val message = runCatching { JSONObject(body).getJSONObject("error").getString("message") }.getOrNull()
                 throw ApiFailure(status, message ?: "The server rejected the request ($status).")

@@ -6,12 +6,14 @@ Control enrolled Android phones and iPhones from an agent or operator console. R
 
 ```mermaid
 flowchart LR
-    Agent["MCP agent"] -->|"Sessions and actions"| Service["mobile-use service"]
-    Console["Operator console"] -->|"Approval and viewing"| Service
-    Connector["Device connector"] <-->|"Local or mutual TLS"| Service
-    Connector -->|"Authorized ADB"| Android["Android"]
-    Connector -->|"Appium on a Mac"| iPhone["iPhone"]
-    Companion["Android companion"] <-->|"HTTPS and on-device consent"| Service
+    Agent[MCP agent] -->|sessions and actions| Service[mobile-use service]
+    Console[Operator console] -->|approval and viewing| Service
+    Connector[Device connector] -->|local API or mutual TLS| Service
+    Service -->|authorized commands| Connector
+    Connector -->|authorized ADB| Android[Android]
+    Connector -->|Appium on a Mac| iPhone[iPhone]
+    Companion[Android companion] -->|HTTPS frames and sensors| Service
+    Service -->|approved requests| Companion
 ```
 
 ## Choose how to connect
@@ -68,7 +70,7 @@ Download `mobile-use-companion-<version>.apk` on Android 14 or later. Open it in
    - Tap **Scan QR code** and scan the QR code shown in the console or terminal, or
    - Tap your computer under **Nearby on Wi-Fi**, verify the fingerprint, and enter the 8-character code.
 3. **Remote HTTPS servers:** Configure `--companion-origin` on the remote server and point your local CLI with `./mobile-use remote set --url https://... --token <TOKEN>`. Then scan the QR code or choose **Remote HTTPS** in the Android app.
-4. Keep the app available to review requests. Approve Android’s screen-sharing prompt and each camera or microphone request as needed. Use **Stop** in the app or console to end sharing, or **Unpair phone** / **Unpair companion** to revoke credentials.
+4. Keep the app available to review requests. For screen sharing, approve the session, tap **Share screen** on its active card, then approve Android’s screen-capture prompt. The console receives frames automatically while sharing is active. Approve each camera or microphone request on the phone as needed. Use **Stop** in the app or console to end sharing, or **Unpair phone** / **Unpair companion** to revoke credentials.
 
 The companion supports screen sharing, camera stills, and microphone clips without Android debugging. Touch, typing, and app control use the separate ADB enrollment.
 
@@ -87,17 +89,19 @@ claude mcp add --transport stdio mobile-use -- /absolute/path/mobile-use mcp
 
 A workstation install reads its local agent token automatically. To connect the CLI and stdio MCP server to a remote server, run `./mobile-use remote set --url https://... --token <TOKEN>` (or set `MOBILE_USE_URL` and `MOBILE_USE_TOKEN`). Use the agent credential for automation and keep the admin credential for the console.
 
-A network client can use Streamable HTTP at the private `https://<host>/mcp` endpoint. A typical MCP workflow calls `devices_list`, `session_start`, `session_status`, `observe`, `act`, and `session_end`. Use a fresh `frame_id` for screen-relative input and a unique `operation_id` for each action. If an outcome is unknown, observe the phone before retrying.
+A network client can use Streamable HTTP at the private `https://<host>/mcp` endpoint. A typical MCP workflow calls `devices_list`, `session_start`, `session_status`, `observe`, and `session_end`. `apps_list`, `app_launch`, and `app_terminate` manage installed apps. Use `act` for gestures, `keyboard_type` for text, and `navigation_key` for Home, Back, Overview, Enter, and other supported keys. Use a fresh `frame_id` for screen-relative input and a unique `operation_id` for each action. If an outcome is unknown, observe the phone before retrying.
+
+App and input controls require an Android device connected through authorized USB or Wireless ADB (or a supported iPhone connector); the Android companion provides screen sharing and approved sensors, not device input. To install or reset an APK through MCP, configure the connector’s pinned `--android-catalog`, enroll the Android device as **Dedicated**, and grant the agent **Approved app install/reset**. In an active session with Apps, Touch, and app-management access, call `apps_catalog`, then `app_install` or `app_reset` with the exact confirmation `install <artifact_id>` or `reset <artifact_id>`. The connector only accepts the catalog’s APKs.
 
 ```mermaid
 flowchart LR
-    Request["Request access"] --> Profile{"Device profile"}
-    Profile -->|"Personal"| Consent["Owner approves and stays present"]
-    Profile -->|"Dedicated"| Grant["Policy grants the requested access"]
-    Consent --> Lease["Active session"]
+    Request[Request access] --> Profile{Device profile}
+    Profile -->|Personal| Consent[Owner approves and stays present]
+    Profile -->|Dedicated| Grant[Policy grants requested access]
+    Consent --> Lease[Active session]
     Grant --> Lease
-    Lease --> Control["Observe and act"]
-    Control --> End["Stop or expire"]
+    Lease --> Control[Observe and act]
+    Control --> End[Stop or expire]
 ```
 
 ## Install the private service

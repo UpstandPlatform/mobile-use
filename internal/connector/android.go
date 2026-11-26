@@ -57,13 +57,17 @@ func (a Android) Discover(ctx context.Context) ([]Found, error) {
 		}
 		virtual := strings.HasPrefix(parts[0], "emulator-")
 		capabilities := wire.Capabilities{wire.Screen: true, wire.Tree: true, wire.Touch: true, wire.Text: true, wire.Apps: true, wire.Browser: true}
+		catalog := a.Catalog.items()
+		if len(catalog) > 0 {
+			capabilities[wire.AppManagement] = true
+		}
 		if a.UseHelper {
 			installed, err := runProcess(ctx, a.path(), "-s", parts[0], "shell", "pm path org.mobileuse.control")
 			capabilities[wire.MultiTouch] = err == nil && bytes.HasPrefix(installed, []byte("package:"))
 		}
 		devices = append(devices, Found{NativeID: parts[0], Inventory: wire.Inventory{
 			Label: label, Platform: "android", Mode: "adb", Virtual: virtual,
-			Capabilities: capabilities, LiveVideo: a.ScrcpyServer != "", Catalog: a.Catalog.items(),
+			Capabilities: capabilities, LiveVideo: a.ScrcpyServer != "", Catalog: catalog,
 		}})
 	}
 	return devices, nil

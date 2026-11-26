@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -39,12 +40,13 @@ type Companion struct {
 	Mode            string
 	HostName        string
 
-	mu       sync.Mutex
-	frames   map[string]phoneFrame
-	requests map[string]sensorEntry
-	pairings map[string]*pairingRecord
-	byCode   map[string]string
-	attempts map[string][]time.Time
+	mu        sync.Mutex
+	frames    map[string]phoneFrame
+	frameSubs map[string]map[chan frameEvent]struct{}
+	requests  map[string]sensorEntry
+	pairings  map[string]*pairingRecord
+	byCode    map[string]string
+	attempts  map[string][]time.Time
 }
 
 type pairingRecord struct {
@@ -67,6 +69,13 @@ type phoneFrame struct {
 	session     string
 	generation  int64
 }
+
+type frameEvent struct {
+	kind       string
+	data       []byte
+	session    string
+	generation int64
+}
 type sensorEntry struct {
 	status            wire.SensorStatus
 	workspace, device string
@@ -81,6 +90,7 @@ func NewCompanion(db *store.Store, origin string) *Companion {
 		AllowedOrigins: []string{origin},
 		Mode:           "remote",
 		frames:         make(map[string]phoneFrame),
+		frameSubs:      make(map[string]map[chan frameEvent]struct{}),
 		requests:       make(map[string]sensorEntry),
 		pairings:       make(map[string]*pairingRecord),
 		byCode:         make(map[string]string),
@@ -173,6 +183,7 @@ func (c *Companion) selectOrigin(requested string) (string, bool) {
 }
 
 func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin string) {
+	router.Handle("GET /v1/companion/sessions/{id}/frames", auth.Require(withActor(c.streamFrames), origin))
 	router.Handle("POST /v1/companion/pairing", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		var req struct {
 			Origin      string   `json:"origin"`
@@ -516,6 +527,9 @@ func (c *Companion) ensureMapsLocked() {
 	if c.frames == nil {
 		c.frames = make(map[string]phoneFrame)
 	}
+	if c.frameSubs == nil {
+		c.frameSubs = make(map[string]map[chan frameEvent]struct{})
+	}
 	if c.requests == nil {
 		c.requests = make(map[string]sensorEntry)
 	}
@@ -527,6 +541,140 @@ func (c *Companion) ensureMapsLocked() {
 	}
 	if c.attempts == nil {
 		c.attempts = make(map[string][]time.Time)
+	}
+}
+
+func (c *Companion) streamFrames(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+	session, err := c.Store.Session(r.Context(), actor, r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	canObserve := actor.CanManage() || actor.Role == wire.Owner && actor.Subject == session.Owner || actor.Role == wire.Agent && actor.Subject == session.Controller
+	if !canObserve || session.State != wire.Active || !containsCap(session.Capabilities, wire.Screen) {
+		writeError(w, wire.ErrForbidden)
+		return
+	}
+	devices, err := c.Store.Devices(r.Context(), actor, time.Now())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	companion := false
+	for _, device := range devices {
+		if device.ID == session.DeviceID && device.Mode == "companion" {
+			companion = true
+			break
+		}
+	}
+	if !companion {
+		writeError(w, wire.ErrNotFound)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, wire.Error("STREAM_UNAVAILABLE", "This server cannot stream screen updates.", 500))
+		return
+	}
+	channel, initial := c.subscribeFrames(session.DeviceID)
+	defer c.unsubscribeFrames(session.DeviceID, channel)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if initial != nil && initial.session == session.ID && initial.generation == session.Generation && time.Since(initial.observation.CapturedAt) < 3*time.Second {
+		if data, marshalErr := json.Marshal(initial.observation); marshalErr == nil {
+			writeFrameEvent(w, flusher, frameEvent{kind: "frame", data: data})
+		}
+	} else {
+		writeFrameEvent(w, flusher, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
+	}
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-channel:
+			if event.kind == "frame" && (event.session != session.ID || event.generation != session.Generation) {
+				continue
+			}
+			if !writeFrameEvent(w, flusher, event) {
+				return
+			}
+		case <-keepalive.C:
+			setStreamWriteDeadline(w)
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func writeFrameEvent(w http.ResponseWriter, flusher http.Flusher, event frameEvent) bool {
+	setStreamWriteDeadline(w)
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.kind, event.data); err != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
+}
+
+func setStreamWriteDeadline(w http.ResponseWriter) {
+	// The server has a short write timeout for ordinary requests. Renew it on each
+	// stream write so an active screen feed can remain connected indefinitely.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Second))
+}
+
+func (c *Companion) subscribeFrames(device string) (chan frameEvent, *phoneFrame) {
+	channel := make(chan frameEvent, 1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureMapsLocked()
+	if c.frameSubs[device] == nil {
+		c.frameSubs[device] = make(map[chan frameEvent]struct{})
+	}
+	c.frameSubs[device][channel] = struct{}{}
+	if frame, ok := c.frames[device]; ok {
+		return channel, &frame
+	}
+	return channel, nil
+}
+
+func (c *Companion) unsubscribeFrames(device string, channel chan frameEvent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.frameSubs[device], channel)
+	if len(c.frameSubs[device]) == 0 {
+		delete(c.frameSubs, device)
+	}
+}
+
+func (c *Companion) publishFrameLocked(device string, frame phoneFrame) {
+	if len(c.frameSubs[device]) == 0 {
+		return
+	}
+	data, err := json.Marshal(frame.observation)
+	if err != nil {
+		return
+	}
+	c.publishEventLocked(device, frameEvent{kind: "frame", data: data, session: frame.session, generation: frame.generation})
+}
+
+func (c *Companion) publishEventLocked(device string, event frameEvent) {
+	for channel := range c.frameSubs[device] {
+		select {
+		case channel <- event:
+		default:
+			select {
+			case <-channel:
+			default:
+			}
+			select {
+			case channel <- event:
+			default:
+			}
+		}
 	}
 }
 
@@ -598,10 +746,6 @@ func (c *Companion) uploadFrame(w http.ResponseWriter, r *http.Request, phone st
 		writeError(w, wire.Error("INVALID_FRAME", "The display frame dimensions are unsupported.", 400))
 		return
 	}
-	if _, _, err := c.Store.ChangeSession(ctx, ownerActor(phone), session.ID, "presence", now); err != nil {
-		writeError(w, err)
-		return
-	}
 	orientation := "portrait"
 	if width > height {
 		orientation = "landscape"
@@ -615,6 +759,7 @@ func (c *Companion) uploadFrame(w http.ResponseWriter, r *http.Request, phone st
 		return
 	}
 	c.frames[phone.ID] = phoneFrame{frame, session.ID, session.Generation}
+	c.publishFrameLocked(phone.ID, c.frames[phone.ID])
 	c.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -705,7 +850,7 @@ func (c *Companion) Dispatch(_ context.Context, target store.Target, command wir
 	case "observe":
 		frame := c.frames[target.Device]
 		if frame.session != target.Session || frame.generation != target.Generation {
-			return wire.Result{}, wire.Error("SHARING_INACTIVE", "The owner must start screen sharing on the phone.", 409)
+			return wire.Result{}, wire.Error("SHARING_INACTIVE", "Start screen sharing in the companion app and approve Android’s screen-capture prompt.", 409)
 		}
 		result.Observation = &frame.observation
 	case "sensor_request":
@@ -748,6 +893,7 @@ func (c *Companion) Stop(target store.Target) {
 	defer c.mu.Unlock()
 	if frame := c.frames[target.Device]; target.Session == "" || frame.session == target.Session {
 		delete(c.frames, target.Device)
+		c.publishEventLocked(target.Device, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
 	}
 	for id, entry := range c.requests {
 		if entry.workspace == target.Workspace && entry.device == target.Device && (entry.status.SessionID == target.Session || target.Session == "") {
@@ -760,6 +906,7 @@ func (c *Companion) sweepLocked(now time.Time) {
 	for id, frame := range c.frames {
 		if now.Sub(frame.observation.CapturedAt) > 3*time.Second {
 			delete(c.frames, id)
+			c.publishEventLocked(id, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
 		}
 	}
 	for id, entry := range c.requests {

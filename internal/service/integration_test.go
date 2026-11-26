@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -285,6 +286,49 @@ func TestPersonalSessionMCPAndControl(t *testing.T) {
 	}
 	if events := request[[]wire.AuditEvent](t, f.owner, "GET", "/v1/audit", nil); len(events) < 10 {
 		t.Fatal("audit events were missing")
+	}
+}
+
+func TestAuditPagination(t *testing.T) {
+	f := setup(t)
+	caps := []wire.Capability{wire.Screen}
+	enroll(t, f, f.device, wire.Personal, caps)
+	for _, purpose := range []string{"Audit page one request", "Audit page two request"} {
+		request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{
+			DeviceID: f.device, Purpose: purpose, Capabilities: caps,
+		})
+	}
+	first := request[wire.AuditPage](t, f.owner, "GET", "/v1/audit/page?page=1&page_size=1", nil)
+	second := request[wire.AuditPage](t, f.owner, "GET", "/v1/audit/page?page=2&page_size=1", nil)
+	if first.Page != 1 || first.PageSize != 1 || first.Total < 2 || first.TotalPages < 2 || len(first.Items) != 1 {
+		t.Fatalf("unexpected first audit page: %+v", first)
+	}
+	if second.Page != 2 || len(second.Items) != 1 || first.Items[0].Session == second.Items[0].Session {
+		t.Fatalf("pagination did not return distinct rows: first=%+v second=%+v", first, second)
+	}
+	legacy := request[[]wire.AuditEvent](t, f.owner, "GET", "/v1/audit", nil)
+	if len(legacy) < 2 {
+		t.Fatalf("legacy audit endpoint lost compatibility: %d events", len(legacy))
+	}
+	if err := f.owner.Request(t.Context(), "GET", "/v1/audit/page?page=0&page_size=1", nil, nil); err == nil || wire.Public(err).Code != "INVALID_PAGINATION" {
+		t.Fatalf("invalid audit page was not rejected: %v", err)
+	}
+}
+
+func TestPerimeterAllowsRuntimeStyleAttributesWithoutInlineScripts(t *testing.T) {
+	f := setup(t)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, f.origin+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	policy := response.Header.Get("Content-Security-Policy")
+	if !strings.Contains(policy, "style-src-attr 'unsafe-inline'") || strings.Contains(policy, "script-src 'self' 'unsafe-inline'") {
+		t.Fatalf("unexpected CSP policy: %s", policy)
 	}
 }
 

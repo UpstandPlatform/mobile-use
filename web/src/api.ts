@@ -62,6 +62,7 @@ export type UINode = {
   focused?: boolean;
 };
 export type Audit = { at: string; actor: string; event: string; device?: string; session?: string; code?: string };
+export type AuditPage = { items: Audit[]; page: number; page_size: number; total: number; total_pages: number };
 export type OIDC = { issuer: string; client_id: string; authorization_endpoint: string; token_endpoint: string; resource: string; companion_enabled: boolean; local_exchange?: boolean };
 export type CompanionEndpoint = { origin: string; interface?: string; primary?: boolean };
 export type SystemInfo = {
@@ -132,16 +133,44 @@ export const labels: Record<string, string> = {
   app_management: 'Approved app install/reset',
 };
 
-export async function api<T>(token: string, path: string, method = 'GET', body?: unknown): Promise<T> {
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export async function api<T>(
+  token: string,
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(path, {
     method,
     headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
     body: body === undefined ? undefined : JSON.stringify(body),
     redirect: 'error',
+    signal,
   });
   if (response.status === 204) return undefined as T;
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error?.message || `Request failed (${response.status})`);
+  const text = await response.text();
+  let value: unknown;
+  try {
+    value = text ? JSON.parse(text) : undefined;
+  } catch {
+    if (!response.ok) throw new ApiError(`Request failed (${response.status})`, response.status);
+    throw new ApiError('The server returned an unreadable response.', response.status);
+  }
+  const fault = (value as { error?: { message?: string; code?: string } } | undefined)?.error;
+  if (!response.ok) {
+    throw new ApiError(fault?.message || `Request failed (${response.status})`, response.status, fault?.code);
+  }
   return value as T;
 }
 

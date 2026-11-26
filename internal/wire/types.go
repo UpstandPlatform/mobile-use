@@ -371,6 +371,14 @@ type AuditEvent struct {
 	Code      string    `json:"code,omitempty"`
 }
 
+type AuditPage struct {
+	Items      []AuditEvent `json:"items"`
+	Page       int          `json:"page"`
+	PageSize   int          `json:"page_size"`
+	Total      int          `json:"total"`
+	TotalPages int          `json:"total_pages"`
+}
+
 type Dispatch struct {
 	DeviceID   string    `json:"device_id"`
 	SessionID  string    `json:"session_id"`

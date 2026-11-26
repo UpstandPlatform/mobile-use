@@ -25,7 +25,7 @@ func Handler() http.Handler {
 			assets.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/" || r.URL.Path == "/auth/callback" {
+		if isConsoleRoute(r.URL.Path) {
 			data, err := fs.ReadFile(root, "index.html")
 			if err != nil {
 				data, err = files.ReadFile("placeholder.html")
@@ -40,4 +40,16 @@ func Handler() http.Handler {
 		}
 		http.NotFound(w, r)
 	})
+}
+
+func isConsoleRoute(path string) bool {
+	switch path {
+	case "/", "/auth/callback", "/devices", "/sessions", "/agent-setup", "/downloads", "/audit":
+		return true
+	}
+	if strings.HasPrefix(path, "/devices/") {
+		id := strings.TrimPrefix(path, "/devices/")
+		return id != "" && !strings.Contains(id, "/") && !strings.Contains(id, ".")
+	}
+	return false
 }

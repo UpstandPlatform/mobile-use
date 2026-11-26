@@ -50,9 +50,13 @@ class ScreenShareService : Service() {
     private var api: CompanionApi? = null
     private var frameStream: ScreenFrameStream? = null
     private var lastFrame = 0L
+    private var lastCapturedAt = 0L
     @Volatile
     private var lastSuccess = 0L
     private var startedAt = 0L
+    private var firstFrameRecoveryAttempted = false
+    private var sourceWidth = 0
+    private var sourceHeight = 0
     private var frameIntervalMs = REMOTE_FRAME_INTERVAL_MS
     private val displayStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -69,8 +73,19 @@ class ScreenShareService : Service() {
                 reportError("The phone is reconnecting to the server. Screen sharing will resume when Wi-Fi is back.")
             }
             val frameAt = Sharing.lastFrameAt.value
-            if (frameAt == null && now - startedAt > 10000L) {
-                reportError("Android has not produced a screen frame yet. Stop sharing and approve the screen prompt again.")
+            val captureAge = now - startedAt
+            if (lastCapturedAt == 0L && captureAge > FIRST_FRAME_RECOVERY_MS && !firstFrameRecoveryAttempted) {
+                firstFrameRecoveryAttempted = true
+                reportError("Screen capture is taking longer than expected. Restarting the capture surface…")
+                if (sourceWidth > 0 && sourceHeight > 0) {
+                    runCatching { configure(sourceWidth, sourceHeight) }.onFailure {
+                        reportError("Android could not restart the screen capture surface. Reopen Share screen and approve the prompt again.")
+                    }
+                }
+            } else if (lastCapturedAt == 0L && captureAge > FIRST_FRAME_TIMEOUT_MS) {
+                reportError("Android has not produced a screen frame. Check that you selected the whole screen in Android’s capture prompt, then stop and restart sharing.")
+            } else if (frameAt == null && lastCapturedAt > 0L && captureAge > FRAME_ACK_TIMEOUT_MS) {
+                reportError("Android is capturing the screen, but the server has not confirmed a frame. Check the phone’s Wi-Fi and server connection.")
             } else if (frameAt != null && now - frameAt > 10000L) {
                 reportError("Screen frames stopped reaching the server. Check Wi-Fi, then restart screen sharing.")
             } else if (frameAt != null && now - frameAt > FRAME_STALE_MS && frameStream?.mode() == FrameStreamMode.READY) {
@@ -155,21 +170,32 @@ class ScreenShareService : Service() {
         ).also { it.start() }
         lastSuccess = SystemClock.elapsedRealtime()
         startedAt = lastSuccess
+        lastCapturedAt = 0L
+        lastFrame = 0L
+        firstFrameRecoveryAttempted = false
+        sourceWidth = 0
+        sourceHeight = 0
         reportError(null)
         Sharing.lastFrameAt.value = null
         try {
             val manager = getSystemService(MediaProjectionManager::class.java)
             projection = manager.getMediaProjection(intent.getIntExtra(RESULT, 0), permission)
+                ?: throw IllegalStateException("Android did not return a screen projection.")
             projection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() { stopSelf() }
                 override fun onCapturedContentResize(width: Int, height: Int) {
-                    if (!closing.get() && display != null) configure(width, height)
+                    if (closing.get() || width < 1 || height < 1) return
+                    sourceWidth = width
+                    sourceHeight = height
+                    if (display != null) configure(width, height)
                 }
             }, captureHandler)
             val bounds = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
             captureHandler.post {
-                runCatching { configure(bounds.width(), bounds.height()) }.onFailure {
-                    reportError("Android could not start screen capture. Stop sharing and approve the screen prompt again.")
+                val width = sourceWidth.takeIf { it > 0 } ?: bounds.width()
+                val height = sourceHeight.takeIf { it > 0 } ?: bounds.height()
+                runCatching { configure(width, height) }.onFailure {
+                    reportError("Android could not start the screen capture surface. Reopen Share screen and approve the prompt again.")
                     stopSelf()
                 }
             }
@@ -183,7 +209,9 @@ class ScreenShareService : Service() {
 
     private fun configure(width: Int, height: Int) {
         if (width < 1 || height < 1 || closing.get()) return
-        val source = projection ?: return
+        val source = projection ?: throw IllegalStateException("The screen projection is unavailable.")
+        sourceWidth = width
+        sourceHeight = height
         val scale = minOf(1f, 960f / maxOf(width, height))
         val outputWidth = (width * scale).roundToInt()
         val outputHeight = (height * scale).roundToInt()
@@ -196,6 +224,7 @@ class ScreenShareService : Service() {
         if (existing == null) {
             display = source.createVirtualDisplay("mobile-use screen sharing", outputWidth, outputHeight, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, next.surface, null, captureHandler)
+                ?: throw IllegalStateException("Android did not create a virtual display.")
         } else {
             existing.resize(outputWidth, outputHeight, density)
             existing.surface = next.surface
@@ -208,6 +237,7 @@ class ScreenShareService : Service() {
         val image = runCatching { source.acquireLatestImage() }.getOrNull() ?: return
         image.use { frame ->
             val now = SystemClock.elapsedRealtime()
+            lastCapturedAt = now
             if (now - lastFrame < frameIntervalMs || !uploading.compareAndSet(false, true)) return
             lastFrame = now
             val id = sessionId
@@ -313,6 +343,9 @@ class ScreenShareService : Service() {
         private const val LAN_FRAME_INTERVAL_MS = 125L
         private const val REMOTE_FRAME_INTERVAL_MS = 200L
         private const val FRAME_STALE_MS = 3500L
+        private const val FIRST_FRAME_RECOVERY_MS = 6000L
+        private const val FIRST_FRAME_TIMEOUT_MS = 15000L
+        private const val FRAME_ACK_TIMEOUT_MS = 5000L
         private const val STOP = "org.mobileuse.companion.STOP"
         private const val SESSION = "session"
         private const val PERMISSION = "permission"

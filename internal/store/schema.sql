@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS audit (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_workspace ON audit(workspace, occurred_at);
+CREATE INDEX IF NOT EXISTS audit_workspace_order ON audit(workspace, occurred_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS viewers (
     id TEXT PRIMARY KEY,

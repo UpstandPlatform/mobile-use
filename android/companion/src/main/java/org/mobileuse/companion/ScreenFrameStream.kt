@@ -14,6 +14,8 @@ import java.util.concurrent.TimeUnit
 
 internal enum class FrameStreamMode { CONNECTING, READY, LEGACY, CLOSED }
 
+private const val MAX_QUEUED_FRAME_BYTES = 1_300_000L
+
 internal fun screenFrameStreamUrl(origin: String, sessionId: String): String =
     origin.trimEnd('/').toHttpUrl().newBuilder()
         .addPathSegments("companion/sessions")
@@ -51,7 +53,11 @@ internal class ScreenFrameStream(
     fun send(bytes: ByteArray): Boolean {
         if (mode != FrameStreamMode.READY) return false
         val active = socket ?: return false
-        if (active.queueSize() > 1_300_000L) return false
+        if (active.queueSize() > MAX_QUEUED_FRAME_BYTES) {
+            onError("The live screen connection fell behind. Reconnecting…")
+            reconnect(active)
+            return false
+        }
         val accepted = active.send(ByteString.of(*bytes))
         if (!accepted) reconnect(active)
         return accepted
@@ -152,6 +158,9 @@ internal class ScreenFrameStream(
             if (closed || mode == FrameStreamMode.LEGACY || socket !== previous) return
             socket = null
             mode = FrameStreamMode.CONNECTING
+            // Cancel a backpressured socket before opening its replacement, so the server
+            // handler and ping traffic do not remain active after this stream is abandoned.
+            previous.cancel()
             if (retryTask != null) return
             val delay = retryDelay
             retryDelay = (retryDelay * 2).coerceAtMost(3000L)

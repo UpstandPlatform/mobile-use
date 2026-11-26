@@ -21,7 +21,7 @@ import (
 var schema string
 
 const (
-	schemaVersion  = 2
+	schemaVersion  = 3
 	ConnectorTTL   = 10 * time.Second
 	PresenceTTL    = 15 * time.Second
 	IdleTimeout    = 5 * time.Minute
@@ -105,7 +105,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			}
 			current = 1
 		}
-		if current < schemaVersion {
+		if current < 2 {
 			if err := s.ensureCompanionPairingColumns(ctx, tx); err != nil {
 				return err
 			}
@@ -119,7 +119,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS companion_pairings_owner_state ON companion_pairings(workspace, owner, state, expires_at)"); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), schemaVersion); err != nil {
+			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), 2); err != nil {
+				return err
+			}
+			current = 2
+		}
+		if current < 3 {
+			if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS audit_workspace_order ON audit(workspace, occurred_at DESC, id DESC)"); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), 3); err != nil {
 				return err
 			}
 		}
@@ -1022,6 +1031,40 @@ func (s *Store) Audit(ctx context.Context, actor wire.Actor, limit int) ([]wire.
 			result = append(result, entry)
 		}
 		return nil
+	})
+	return result, err
+}
+
+func (s *Store) AuditPage(ctx context.Context, actor wire.Actor, page, pageSize int) (wire.AuditPage, error) {
+	result := wire.AuditPage{Items: []wire.AuditEvent{}, Page: page, PageSize: pageSize}
+	if actor.Role != wire.Admin && actor.Role != wire.Auditor {
+		return result, wire.ErrForbidden
+	}
+	if page < 1 || pageSize < 1 || pageSize > 100 || page > int(^uint(0)>>1)/pageSize {
+		return result, wire.Error("INVALID_PAGINATION", "Page must be positive and page size must be between 1 and 100.", 400)
+	}
+	err := s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, s.query("SELECT COUNT(*) FROM audit WHERE workspace = ?"), actor.Workspace).Scan(&result.Total); err != nil {
+			return err
+		}
+		if result.Total > 0 {
+			result.TotalPages = (result.Total-1)/pageSize + 1
+		}
+		return readRowsTx(ctx, tx, s.query("SELECT payload FROM audit WHERE workspace = ? ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?"),
+			[]any{actor.Workspace, pageSize, (page - 1) * pageSize}, func(rows *sql.Rows) error {
+				for rows.Next() {
+					var raw string
+					var entry wire.AuditEvent
+					if err := rows.Scan(&raw); err != nil {
+						return err
+					}
+					if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+						return err
+					}
+					result.Items = append(result.Items, entry)
+				}
+				return nil
+			})
 	})
 	return result, err
 }

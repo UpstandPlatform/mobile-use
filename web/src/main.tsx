@@ -15,10 +15,12 @@ import {
   Trash2,
 } from 'lucide-react';
 import { ThemeProvider, useTheme } from 'next-themes';
-import { api, beginLogin, completeLogin, exchangeLaunchTicket, labels } from './api';
-import type { Actor, Audit, Device, Grant, Observation, OIDC, Session, SystemInfo } from './api';
+import { toast } from 'sonner';
+import { api, ApiError, beginLogin, completeLogin, exchangeLaunchTicket, labels } from './api';
+import type { Actor, Audit, AuditPage, Device, Grant, Observation, OIDC, Session, SystemInfo } from './api';
 import { AddDevicePanel } from './AddDevicePanel';
 import { LiveVideo } from './LiveVideo';
+import { consolePath, readConsoleRoute } from './routes';
 const McpSetup = lazy(() => import('./McpSetup').then((module) => ({ default: module.McpSetup })));
 import { AppSidebar } from './AppSidebar';
 import type { ConsolePage } from './AppSidebar';
@@ -48,7 +50,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty';
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
@@ -67,6 +69,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Textarea } from '@/components/ui/textarea';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { Toaster } from '@/components/ui/sonner';
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from '@/components/ui/pagination';
 import './index.css';
 
 type Tab = ConsolePage;
@@ -76,17 +86,32 @@ type AndroidKey = 'enter' | 'tab' | 'escape' | 'menu' | 'dpad_up' | 'dpad_down' 
 const time = (date: string) => new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const errorText = (error: unknown) => (error instanceof Error ? error.message : 'Something went wrong.');
 
+function auditPageNumbers(current: number, total: number) {
+  if (total <= 0) return [];
+  const count = Math.min(5, total);
+  const start = Math.max(1, Math.min(current - Math.floor(count / 2), total - count + 1));
+  return Array.from({ length: count }, (_, index) => start + index);
+}
+
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem('mobile-use.token') || '');
   const [draftToken, setDraftToken] = useState('');
   const [oidc, setOIDC] = useState<OIDC>();
+  const [authConfigLoading, setAuthConfigLoading] = useState(true);
+  const [identityLoading, setIdentityLoading] = useState(() => Boolean(sessionStorage.getItem('mobile-use.token')));
   const [systemInfo, setSystemInfo] = useState<SystemInfo>();
   const [actor, setActor] = useState<Actor>();
   const [devices, setDevices] = useState<Device[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [audits, setAudits] = useState<Audit[]>([]);
-  const [tab, setTab] = useState<Tab>('Overview');
-  const [selected, setSelected] = useState('');
+  const [tab, setTab] = useState<Tab>(() => readConsoleRoute().page);
+  const [selected, setSelected] = useState(() => readConsoleRoute().deviceId);
+  const [inventoryState, setInventoryState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [audits, setAudits] = useState<AuditPage>();
+  const [auditPage, setAuditPage] = useState(() => readConsoleRoute().auditPage);
+  const [auditPageSize, setAuditPageSize] = useState(() => readConsoleRoute().auditPageSize);
+  const [auditState, setAuditState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [auditError, setAuditError] = useState('');
+  const [auditReload, setAuditReload] = useState(0);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [captureRevision, setCaptureRevision] = useState(0);
@@ -96,13 +121,14 @@ function App() {
   const signedIn = useCallback((value: string) => {
     sessionStorage.setItem('mobile-use.token', value);
     setToken(value);
+    setIdentityLoading(true);
     setDraftToken('');
   }, []);
 
   useEffect(() => {
     const hash = location.hash;
     const launchTicket = hash.startsWith('#launch=') ? hash.slice('#launch='.length) : '';
-    if (launchTicket) history.replaceState(null, '', '/');
+    if (launchTicket) history.replaceState(null, '', `${location.pathname}${location.search}`);
 
     fetch('/auth/config')
       .then((response) => {
@@ -121,48 +147,62 @@ function App() {
           signedIn(await exchangeLaunchTicket(launchTicket));
         }
       })
-      .catch((error) => setError(errorText(error)));
+      .catch((error) => setError(errorText(error)))
+      .finally(() => setAuthConfigLoading(false));
   }, [signedIn]);
 
   const refresh = useCallback(
-    async (credential: string, identity: Actor) => {
-      const [nextDevices, nextSessions] = await Promise.all([
-        api<Device[]>(credential, '/v1/devices'),
-        api<Session[]>(credential, '/v1/sessions'),
-      ]);
-      setDevices(nextDevices);
-      setSessions(nextSessions);
-      setSelected((current) =>
-        nextDevices.some((device) => device.id === current) ? current : nextDevices[0]?.id || '',
-      );
-      if (tab === 'Audit' && ['admin', 'auditor'].includes(identity.role)) {
-        setAudits(await api<Audit[]>(credential, '/v1/audit'));
+    async (credential: string) => {
+      setInventoryState((current) => current === 'ready' ? current : 'loading');
+      try {
+        const [nextDevices, nextSessions] = await Promise.all([
+          api<Device[]>(credential, '/v1/devices'),
+          api<Session[]>(credential, '/v1/sessions'),
+        ]);
+        setDevices(nextDevices);
+        setSessions(nextSessions);
+        setSelected((current) =>
+          nextDevices.some((device) => device.id === current) ? current : nextDevices[0]?.id || '',
+        );
+        setInventoryState('ready');
+      } catch (error) {
+        setInventoryState((current) => current === 'ready' ? 'ready' : 'error');
+        throw error;
       }
     },
-    [tab],
+    [],
   );
 
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      setIdentityLoading(false);
+      return;
+    }
     let ignore = false;
+    setIdentityLoading(true);
     api<Actor>(token, '/v1/me')
       .then(async (identity) => {
         if (ignore) return;
         setActor(identity);
+        setIdentityLoading(false);
         api<SystemInfo>(token, '/v1/system/info')
           .then((info) => {
             if (!ignore) setSystemInfo(info);
           })
           .catch(() => undefined);
-        // A failed inventory/audit refresh (this effect re-runs on every tab change) is not
-        // an authentication failure and must not drop the signed-in identity.
-        await refresh(token, identity).catch((error) => {
+        // A refresh failure is not an authentication failure and should preserve the session.
+        await refresh(token).catch((error) => {
           if (!ignore) setError(errorText(error));
         });
       })
       .catch((error) => {
         if (!ignore) {
           setActor(undefined);
+          setIdentityLoading(false);
+          if (error instanceof ApiError && [401, 403].includes(error.status)) {
+            sessionStorage.removeItem('mobile-use.token');
+            setToken('');
+          }
           setError(errorText(error));
         }
       });
@@ -174,19 +214,101 @@ function App() {
   useEffect(() => {
     if (!token || !actor) return;
     const timer = window.setInterval(() => {
-      if (!document.hidden) refresh(token, actor).catch((error) => setError(errorText(error)));
+      if (!document.hidden) refresh(token).catch((error) => setError(errorText(error)));
     }, 3500);
     return () => window.clearInterval(timer);
   }, [actor, token, refresh]);
 
-  async function run(task: () => Promise<unknown>) {
+  useEffect(() => {
+    function normalizeCurrentRoute() {
+      const route = readConsoleRoute();
+      const canonical = consolePath(route.page, {
+        deviceId: route.deviceId,
+        auditPage: route.auditPage,
+        auditPageSize: route.auditPageSize,
+      });
+      if (`${location.pathname}${location.search}` !== canonical) {
+        history.replaceState(null, '', canonical);
+      }
+    }
+    function onPopState() {
+      const route = readConsoleRoute();
+      setTab(route.page);
+      setSelected(route.deviceId);
+      setAuditPage(route.auditPage);
+      setAuditPageSize(route.auditPageSize);
+      setShowAddDevice(false);
+      normalizeCurrentRoute();
+    }
+    normalizeCurrentRoute();
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!actor || tab !== 'Audit' || !['admin', 'auditor'].includes(actor.role)) return;
+    const controller = new AbortController();
+    setAuditState('loading');
+    setAuditError('');
+    api<AuditPage>(
+      token,
+      `/v1/audit/page?page=${auditPage}&page_size=${auditPageSize}`,
+      'GET',
+      undefined,
+      controller.signal,
+    )
+      .then((value) => {
+        const lastPage = Math.max(1, value.total_pages);
+        if (auditPage > lastPage) {
+          setAuditPage(lastPage);
+          history.replaceState(null, '', consolePath('Audit', { auditPage: lastPage, auditPageSize }));
+          return;
+        }
+        setAudits(value);
+        setAuditState('ready');
+      })
+      .catch((reason) => {
+        if (controller.signal.aborted) return;
+        setAuditError(errorText(reason));
+        setAuditState('error');
+      });
+    return () => controller.abort();
+  }, [actor, auditPage, auditPageSize, auditReload, tab, token]);
+
+  useEffect(() => {
+    if (tab === 'Audit' && actor && !['admin', 'auditor'].includes(actor.role)) {
+      history.replaceState(null, '', consolePath('Overview'));
+      setTab('Overview');
+    }
+  }, [actor, tab]);
+
+  useEffect(() => {
+    if (tab === 'Devices' && devices.length && !devices.some((item) => item.id === selected)) {
+      const next = devices[0].id;
+      setSelected(next);
+      history.replaceState(null, '', consolePath('Devices', { deviceId: next }));
+    }
+  }, [devices, selected, tab]);
+
+  async function run<T>(task: () => Promise<T>, success?: string): Promise<T | undefined> {
     setBusy(true);
     setError('');
     try {
-      await task();
-      if (actor) await refresh(token, actor);
+      const result = await task();
+      if (success) toast.success(success);
+      if (actor) {
+        try {
+          await refresh(token);
+        } catch {
+          setError('The action completed, but the workspace could not refresh. Try Refresh again.');
+          toast.error('The action completed, but the workspace could not refresh.');
+        }
+      }
+      return result;
     } catch (error) {
       setError(errorText(error));
+      toast.error(errorText(error));
+      return undefined;
     } finally {
       setBusy(false);
     }
@@ -199,12 +321,38 @@ function App() {
     setSystemInfo(undefined);
     setDevices([]);
     setSessions([]);
-    setAudits([]);
+    setAudits(undefined);
     setSelected('');
     setTab('Overview');
+    setInventoryState('loading');
+    setAuditState('idle');
     setShowAddDevice(false);
     setError('');
+    history.pushState(null, '', consolePath('Overview'));
   }
+
+  if (!actor && (authConfigLoading || identityLoading))
+    return (
+      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+        <TooltipProvider>
+          <div className="grid min-h-svh place-items-center bg-muted/40 p-4">
+            <Card className="w-full max-w-md">
+              <CardHeader className="items-center text-center">
+                <span className="grid size-12 place-items-center rounded-2xl bg-primary text-primary-foreground">
+                  <Smartphone className="size-6" />
+                </span>
+                <CardTitle>Opening mobile-use</CardTitle>
+                <CardDescription>Checking your local workspace and sign-in.</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-3">
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-2/3" />
+              </CardContent>
+            </Card>
+          </div>
+        </TooltipProvider>
+      </ThemeProvider>
+    );
 
   if (!actor)
     return (
@@ -292,12 +440,38 @@ function App() {
   const canRemoveDevice = manage || (actor.role === 'owner' && device?.owner === actor.subject);
   const deviceSessions = sessions.filter((item) => item.device_id === selected);
   const active = deviceSessions.find((item) => item.state === 'active');
+  const pending = deviceSessions.find((item) => item.state === 'pending_approval');
   const change = (session: Session, verb: string) =>
-    run(() => api(token, `/v1/sessions/${session.id}/${verb}`, 'POST'));
+    run(
+      () => api(token, `/v1/sessions/${session.id}/${verb}`, 'POST'),
+      ({
+        approve: 'Session approved. Start screen sharing on the phone to send frames.',
+        deny: 'Access request denied.',
+        end: 'Session ended.',
+        pause: 'Session paused.',
+        resume: 'Session resumed.',
+        takeover: 'Control transferred to you.',
+      } as Record<string, string>)[verb],
+    );
   const setPage = (page: ConsolePage) => {
     setTab(page);
     setShowAddDevice(false);
+    history.pushState(null, '', consolePath(page, { deviceId: selected, auditPage, auditPageSize }));
   };
+  const selectDevice = (id: string) => {
+    setSelected(id);
+    history.pushState(null, '', consolePath('Devices', { deviceId: id }));
+  };
+  const selectAuditPage = (page: number, pageSize = auditPageSize) => {
+    const nextPage = Math.max(1, page);
+    setAuditPage(nextPage);
+    history.pushState(
+      null,
+      '',
+      consolePath('Audit', { auditPage: nextPage, auditPageSize: pageSize }),
+    );
+  };
+  const inventoryLoading = inventoryState === 'loading' && devices.length === 0 && sessions.length === 0;
   const titleByPage: Record<Tab, string> = {
     Overview: 'Overview',
     Devices: 'Devices',
@@ -339,7 +513,10 @@ function App() {
                   variant="outline"
                   size="sm"
                   disabled={busy}
-                  onClick={() => run(() => refresh(token, actor))}
+                  onClick={() => {
+                    void run(() => refresh(token), 'Workspace refreshed.');
+                    if (tab === 'Audit') setAuditReload((value) => value + 1);
+                  }}
                 >
                   <RefreshCw data-icon="inline-start" className={busy ? 'animate-spin' : ''} />
                   Refresh
@@ -377,22 +554,35 @@ function App() {
                   <AlertTitle>Action needs attention</AlertTitle>
                   <AlertDescription className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <span>{error}</span>
-                    <Button size="sm" variant="outline" onClick={() => setError('')}>
-                      Dismiss
-                    </Button>
+                    <div className="flex shrink-0 gap-2">
+                      {inventoryState === 'error' && (
+                        <Button size="sm" variant="outline" disabled={busy} onClick={() => void run(() => refresh(token))}>
+                          Retry
+                        </Button>
+                      )}
+                      <Button size="sm" variant="outline" onClick={() => setError('')}>
+                        Dismiss
+                      </Button>
+                    </div>
                   </AlertDescription>
                 </Alert>
               )}
-              {tab === 'Overview' && (
-                <Overview
-                  devices={devices}
-                  sessions={sessions}
-                  systemInfo={systemInfo}
-                  onNavigate={setPage}
-                  onAddDevice={() => setShowAddDevice(true)}
-                />
+              {tab === 'Overview' && (inventoryLoading ? <PageLoading /> : (
+                inventoryState === 'error' && devices.length === 0
+                  ? <LoadError retry={() => void run(() => refresh(token))} />
+                  : <Overview
+                      devices={devices}
+                      sessions={sessions}
+                      systemInfo={systemInfo}
+                      onNavigate={setPage}
+                      onAddDevice={() => setShowAddDevice(true)}
+                    />
+              ))}
+              {tab === 'Devices' && inventoryLoading && <PageLoading />}
+              {tab === 'Devices' && inventoryState === 'error' && devices.length === 0 && (
+                <LoadError retry={() => void run(() => refresh(token))} />
               )}
-              {tab === 'Devices' && (
+              {tab === 'Devices' && !inventoryLoading && !(inventoryState === 'error' && devices.length === 0) && (
                 <div className="grid gap-4 xl:grid-cols-[minmax(17rem,0.72fr)_minmax(0,1.55fr)]">
                   <Card className="min-w-0">
                     <CardHeader className="grid-cols-[minmax(0,1fr)_auto] items-center justify-between gap-2">
@@ -429,7 +619,7 @@ function App() {
                                 type="button"
                                 variant="ghost"
                                 key={item.id}
-                                onClick={() => setSelected(item.id)}
+                                onClick={() => selectDevice(item.id)}
                                 aria-pressed={item.id === selected}
                                 className={`h-auto w-full justify-start gap-3 rounded-lg border p-3 text-left whitespace-normal ${item.id === selected ? 'border-primary/40 bg-primary/5' : 'border-transparent'}`}
                               >
@@ -533,12 +723,39 @@ function App() {
                                 onAttempt={() => setCaptureRevision((value) => value + 1)}
                               />
                             )}
-                          {device.enabled && device.online && !active && actor.role !== 'auditor' && (
+                          {pending && (
+                            <Alert>
+                              <Activity />
+                              <AlertTitle>Access request is waiting for approval</AlertTitle>
+                              <AlertDescription>
+                                {device.online
+                                  ? 'The request is waiting on the phone. After approval, the owner must start screen sharing and accept Android’s capture prompt before frames appear here.'
+                                  : 'The request is still pending on the server. The phone can receive it when it reconnects; screen capture starts only after the owner approves and accepts Android’s capture prompt.'}
+                              </AlertDescription>
+                            </Alert>
+                          )}
+                          {device.enabled && !device.online && !active && !pending && actor.role !== 'auditor' && (
+                            <Alert>
+                              <AlertCircle />
+                              <AlertTitle>Device is offline</AlertTitle>
+                              <AlertDescription>
+                                {device.mode === 'companion'
+                                  ? 'The companion is not checking for requests right now. Open mobile-use on Android, or enable Background connection and allow notifications to receive approvals while the app is closed.'
+                                  : 'Reconnect the device before requesting access. Its current connection is not available to this workspace.'}
+                              </AlertDescription>
+                            </Alert>
+                          )}
+                          {device.enabled && device.online && !active && !pending && actor.role !== 'auditor' && (
                             <StartForm
                               key={`start-${device.id}`}
                               device={device}
                               busy={busy}
-                              submit={(body) => run(() => api(token, '/v1/sessions', 'POST', body))}
+                              submit={(body) =>
+                                run(
+                                  () => api<Session>(token, '/v1/sessions', 'POST', body),
+                                  'Request sent. Review and approve it in the companion app.',
+                                )
+                              }
                             />
                           )}
                           {manage && (
@@ -548,11 +765,17 @@ function App() {
                               device={device}
                               busy={busy}
                               submit={(body) =>
-                                run(() => api(token, `/v1/devices/${device.id}`, 'PUT', body))
+                                run(
+                                  () => api(token, `/v1/devices/${device.id}`, 'PUT', body),
+                                  'Device access settings saved.',
+                                )
                               }
                               onUnpair={
                                 device.mode === 'companion'
-                                  ? () => run(() => api(token, `/v1/companion/${device.id}`, 'DELETE'))
+                                  ? () => run(
+                                      () => api(token, `/v1/companion/${device.id}`, 'DELETE'),
+                                      'Companion unpaired.',
+                                    )
                                   : undefined
                               }
                             />
@@ -578,7 +801,11 @@ function App() {
                   )}
                 </div>
               )}
-              {tab === 'Sessions' && (
+              {tab === 'Sessions' && inventoryLoading && <PageLoading />}
+              {tab === 'Sessions' && inventoryState === 'error' && sessions.length === 0 && devices.length === 0 && (
+                <LoadError retry={() => void run(() => refresh(token))} />
+              )}
+              {tab === 'Sessions' && !inventoryLoading && !(inventoryState === 'error' && sessions.length === 0 && devices.length === 0) && (
                 <div className="grid gap-4 xl:grid-cols-[minmax(18rem,0.72fr)_minmax(0,1.3fr)]">
                   <Card>
                     <CardHeader>
@@ -640,8 +867,8 @@ function App() {
                     devices={devices}
                     systemInfo={systemInfo}
                     onSelectDevice={(id) => {
-                      setSelected(id);
-                      setPage('Devices');
+                      selectDevice(id);
+                      setTab('Devices');
                     }}
                     onNavigateDownloads={() => setPage('Downloads')}
                     onAddDevice={() => setShowAddDevice(true)}
@@ -655,50 +882,122 @@ function App() {
               )}
               {tab === 'Audit' && (
                 <Card>
-                  <CardHeader>
-                    <CardTitle>Workspace audit</CardTitle>
-                    <CardDescription>
-                      Access decisions and device operations recorded for this workspace.
-                    </CardDescription>
+                  <CardHeader className="gap-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="grid gap-1">
+                      <CardTitle>Workspace audit</CardTitle>
+                      <CardDescription>Access decisions and device operations recorded for this workspace.</CardDescription>
+                    </div>
+                    <Button type="button" size="sm" variant="outline" disabled={auditState === 'loading'} onClick={() => setAuditReload((value) => value + 1)}>
+                      <RefreshCw data-icon="inline-start" className={auditState === 'loading' ? 'animate-spin' : ''} />
+                      Refresh audit
+                    </Button>
                   </CardHeader>
-                  <CardContent>
-                    {audits.length === 0 ? (
-                      <Empty>
+                  <CardContent className="grid gap-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <p className="text-sm text-muted-foreground" aria-live="polite">
+                        {audits ? `${audits.total.toLocaleString()} total events` : 'Workspace events'}
+                      </p>
+                      <Field orientation="horizontal" className="w-fit items-center gap-2">
+                        <FieldLabel htmlFor="audit-page-size" className="whitespace-nowrap text-sm font-normal text-muted-foreground">Rows per page</FieldLabel>
+                        <Select value={String(auditPageSize)} onValueChange={(value) => {
+                          const size = Number(value);
+                          if (![10, 25, 50, 100].includes(size)) return;
+                          setAuditPageSize(size);
+                          selectAuditPage(1, size);
+                        }}>
+                          <SelectTrigger id="audit-page-size" className="w-24" aria-label="Audit rows per page"><SelectValue /></SelectTrigger>
+                          <SelectContent><SelectGroup>{[10, 25, 50, 100].map((size) => <SelectItem key={size} value={String(size)}>{size}</SelectItem>)}</SelectGroup></SelectContent>
+                        </Select>
+                      </Field>
+                    </div>
+                    {auditState === 'loading' && (
+                      <div className="grid gap-2 rounded-md border p-4" role="status" aria-label="Loading audit events">
+                        {[0, 1, 2, 3, 4].map((row) => <Skeleton key={row} className="h-10 w-full" />)}
+                      </div>
+                    )}
+                    {auditState === 'error' && (
+                      <Alert variant="destructive">
+                        <AlertCircle />
+                        <AlertTitle>Audit events could not be loaded</AlertTitle>
+                        <AlertDescription className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                          <span>{auditError}</span>
+                          <Button type="button" size="sm" variant="outline" onClick={() => setAuditReload((value) => value + 1)}>Try again</Button>
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                    {auditState === 'ready' && audits?.items.length === 0 && (
+                      <Empty className="rounded-md border">
                         <EmptyHeader>
                           <EmptyMedia variant="icon">
                             <ShieldCheck />
                           </EmptyMedia>
                           <EmptyTitle>No audit events yet</EmptyTitle>
                           <EmptyDescription>
-                            Events appear as devices connect and sessions are requested.
+                            Events will appear here as devices connect and sessions are requested.
                           </EmptyDescription>
                         </EmptyHeader>
                       </Empty>
-                    ) : (
+                    )}
+                    {auditState === 'ready' && Boolean(audits?.items.length) && (
                       <ScrollArea className="max-h-[68vh] rounded-md border">
-                        <Table>
+                        <Table className="min-w-[58rem]">
                           <TableHeader className="sticky top-0 z-10 bg-card">
                             <TableRow>
                               <TableHead>Time</TableHead>
                               <TableHead>Event</TableHead>
                               <TableHead>Identity</TableHead>
+                              <TableHead>Device</TableHead>
+                              <TableHead>Session</TableHead>
                               <TableHead>Result</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {audits.map((item, index) => (
-                              <TableRow key={`${item.at}-${index}`}>
+                            {audits?.items.map((item, index) => (
+                              <TableRow key={`${item.at}-${item.session || item.event}-${index}`}>
                                 <TableCell className="whitespace-nowrap">
-                                  {new Date(item.at).toLocaleString()}
+                                  <time dateTime={item.at}>{new Date(item.at).toLocaleString()}</time>
                                 </TableCell>
-                                <TableCell>{item.event.replaceAll('_', ' ')}</TableCell>
+                                <TableCell className="capitalize">{item.event.replaceAll('_', ' ')}</TableCell>
                                 <TableCell>{item.actor}</TableCell>
+                                <TableCell title={item.device}>{item.device ? item.device.slice(0, 8) : '—'}</TableCell>
+                                <TableCell title={item.session}>{item.session ? item.session.slice(0, 8) : '—'}</TableCell>
                                 <TableCell>{item.code?.replaceAll('_', ' ') || '—'}</TableCell>
                               </TableRow>
                             ))}
                           </TableBody>
                         </Table>
                       </ScrollArea>
+                    )}
+                    {auditState === 'ready' && (audits?.total_pages || 0) > 1 && (
+                      <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+                        <p className="text-sm text-muted-foreground" aria-live="polite">
+                          Showing {((auditPage - 1) * auditPageSize + 1).toLocaleString()}–{Math.min(auditPage * auditPageSize, audits?.total || 0).toLocaleString()} of {(audits?.total || 0).toLocaleString()}
+                        </p>
+                        <Pagination className="mx-0 w-auto justify-start sm:justify-end">
+                          <PaginationContent>
+                            <PaginationItem>
+                              <PaginationPrevious href={consolePath('Audit', { auditPage: Math.max(1, auditPage - 1), auditPageSize })} aria-disabled={auditPage <= 1} className={auditPage <= 1 ? 'pointer-events-none opacity-50' : ''} onClick={(event) => {
+                                event.preventDefault();
+                                if (auditPage > 1) selectAuditPage(auditPage - 1);
+                              }} />
+                            </PaginationItem>
+                            {auditPageNumbers(auditPage, audits?.total_pages || 0).map((page) => (
+                              <PaginationItem key={page}>
+                                <PaginationLink href={consolePath('Audit', { auditPage: page, auditPageSize })} isActive={page === auditPage} aria-label={`Go to page ${page}`} onClick={(event) => {
+                                  event.preventDefault();
+                                  selectAuditPage(page);
+                                }}>{page}</PaginationLink>
+                              </PaginationItem>
+                            ))}
+                            <PaginationItem>
+                              <PaginationNext href={consolePath('Audit', { auditPage: Math.min(audits?.total_pages || 1, auditPage + 1), auditPageSize })} aria-disabled={auditPage >= (audits?.total_pages || 1)} className={auditPage >= (audits?.total_pages || 1) ? 'pointer-events-none opacity-50' : ''} onClick={(event) => {
+                                event.preventDefault();
+                                if (auditPage < (audits?.total_pages || 1)) selectAuditPage(auditPage + 1);
+                              }} />
+                            </PaginationItem>
+                          </PaginationContent>
+                        </Pagination>
+                      </div>
                     )}
                   </CardContent>
                 </Card>
@@ -758,8 +1057,12 @@ function App() {
                     onClose={() => setShowAddDevice(false)}
                     onNavigateDownloads={() => setPage('Downloads')}
                     onDeviceAdded={async (deviceId) => {
-                      await refresh(token, actor);
-                      if (deviceId) setSelected(deviceId);
+                      await refresh(token);
+                      if (deviceId) {
+                        selectDevice(deviceId);
+                        setTab('Devices');
+                        setShowAddDevice(false);
+                      }
                     }}
                   />
                 </div>
@@ -799,6 +1102,21 @@ function PageLoading() {
       </div>
       <Skeleton className="h-72 w-full rounded-xl" />
     </div>
+  );
+}
+
+function LoadError({ retry }: { retry: () => void }) {
+  return (
+    <Card>
+      <Empty className="min-h-72 border-0">
+        <EmptyHeader>
+          <EmptyMedia variant="icon"><AlertCircle /></EmptyMedia>
+          <EmptyTitle>Workspace data could not be loaded</EmptyTitle>
+          <EmptyDescription>Check the connection to the mobile-use service, then try again.</EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent><Button onClick={retry}>Try again</Button></EmptyContent>
+      </Empty>
+    </Card>
   );
 }
 
@@ -952,6 +1270,17 @@ function EnrollmentForm({
   const [name, setName] = useState(device.label);
   const [profile, setProfile] = useState(device.profile || 'personal');
   const [owner, setOwner] = useState(device.owner || actor.subject);
+  const [attemptedSave, setAttemptedSave] = useState(false);
+  const [agentError, setAgentError] = useState('');
+  const subjectPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:@-]{0,127}$/;
+  const nameError = name.trim().length === 0
+    ? 'Enter a name for this device.'
+    : name.trim().length > 128
+      ? 'Device names can be at most 128 characters.'
+      : '';
+  const ownerError = !subjectPattern.test(owner.trim())
+    ? 'Use 1–128 letters, numbers, dots, underscores, colons, @ signs, or hyphens.'
+    : '';
   const supported = Object.keys(device.capabilities).filter((cap) => device.capabilities[cap]);
   const [grantList, setGrantList] = useState<Grant[]>(() =>
     (device.grants || []).map((g) => ({ subject: g.subject, capabilities: [...g.capabilities] })),
@@ -962,9 +1291,17 @@ function EnrollmentForm({
 
   function addAgent(subject: string) {
     const clean = subject.trim();
-    if (!clean || grantList.some((g) => g.subject === clean)) return;
+    if (!subjectPattern.test(clean)) {
+      setAgentError('Enter a valid agent identity (1–128 letters, numbers, dots, underscores, colons, @ signs, or hyphens).');
+      return;
+    }
+    if (grantList.some((g) => g.subject === clean)) {
+      setAgentError('That agent already has a grant for this device.');
+      return;
+    }
     setGrantList((current) => [...current, { subject: clean, capabilities: [...supported] }]);
     setNewSubject('');
+    setAgentError('');
   }
 
   function toggleCap(subject: string, cap: string, checked: boolean) {
@@ -979,13 +1316,15 @@ function EnrollmentForm({
 
   function onboard(event: FormEvent) {
     event.preventDefault();
+    setAttemptedSave(true);
+    if (nameError || ownerError) return;
     const cleaned = grantList
       .map((g) => ({
         subject: g.subject.trim(),
         capabilities: g.capabilities.filter((c) => supported.includes(c)),
       }))
       .filter((g) => g.subject && g.capabilities.length > 0);
-    submit({ label: name, owner, profile, grants: cleaned, enabled: true });
+    submit({ label: name.trim(), owner: owner.trim(), profile, grants: cleaned, enabled: true });
   }
 
   const hasLocalAgent = grantList.some((g) => g.subject === 'local-agent');
@@ -1001,26 +1340,28 @@ function EnrollmentForm({
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-5">
-        <form onSubmit={onboard} className="grid gap-5">
+        <form noValidate onSubmit={onboard} className="grid gap-5">
           <FieldGroup className="sm:flex-row">
-            <Field className="sm:flex-1">
+            <Field className="sm:flex-1" data-invalid={attemptedSave && Boolean(nameError)}>
               <FieldLabel htmlFor="device-name">Device name</FieldLabel>
               <Input
                 id="device-name"
-                required
                 maxLength={128}
+                aria-invalid={attemptedSave && Boolean(nameError)}
                 value={name}
                 onChange={(event) => setName(event.target.value)}
               />
+              {attemptedSave && nameError && <FieldError>{nameError}</FieldError>}
             </Field>
-            <Field className="sm:flex-1">
+            <Field className="sm:flex-1" data-invalid={attemptedSave && Boolean(ownerError)}>
               <FieldLabel htmlFor="device-owner">Owner identity</FieldLabel>
               <Input
                 id="device-owner"
-                required
+                aria-invalid={attemptedSave && Boolean(ownerError)}
                 value={owner}
                 onChange={(event) => setOwner(event.target.value)}
               />
+              {attemptedSave && ownerError && <FieldError>{ownerError}</FieldError>}
             </Field>
             <Field className="sm:flex-1">
               <FieldLabel>Access profile</FieldLabel>
@@ -1100,7 +1441,11 @@ function EnrollmentForm({
                 aria-label="Agent identity to grant"
                 placeholder={actor.workspace === 'local' ? 'local-agent' : 'agent-identity'}
                 value={newSubject}
-                onChange={(event) => setNewSubject(event.target.value)}
+                onChange={(event) => {
+                  setNewSubject(event.target.value);
+                  if (agentError) setAgentError('');
+                }}
+                aria-invalid={Boolean(agentError)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     event.preventDefault();
@@ -1117,9 +1462,10 @@ function EnrollmentForm({
                 Add agent
               </Button>
             </div>
+            {agentError && <FieldError>{agentError}</FieldError>}
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button disabled={busy}>{device.enabled ? 'Save access' : 'Enroll device'}</Button>
+            <Button disabled={busy || Boolean(nameError) || Boolean(ownerError)}>{busy ? 'Saving…' : device.enabled ? 'Save access' : 'Enroll device'}</Button>
             {device.enabled && (
               <Button
                 type="button"
@@ -1190,9 +1536,16 @@ function StartForm({
 }: {
   device: Device;
   busy: boolean;
-  submit: (value: unknown) => void;
+  submit: (value: unknown) => Promise<Session | undefined>;
 }) {
   const [purpose, setPurpose] = useState('');
+  const [attempted, setAttempted] = useState(false);
+  const purposeValue = purpose.trim();
+  const purposeError = purposeValue.length < 3
+    ? 'Enter a purpose with at least 3 non-space characters.'
+    : purposeValue.length > 256
+      ? 'Keep the purpose to 256 characters or fewer.'
+      : '';
   const options = Object.keys(device.capabilities).filter((cap) => device.capabilities[cap]);
   const [selected, setSelected] = useState(
     options.filter((cap) => ['screen', 'touch', 'ui_tree', 'text'].includes(cap)),
@@ -1202,34 +1555,42 @@ function StartForm({
       <CardHeader>
         <CardTitle className="text-base">Request a device session</CardTitle>
         <CardDescription>
-          The phone owner reviews the purpose and selected capabilities before access starts.
+          The phone owner reviews this request. Screen capture also needs to be started and approved on the phone.
         </CardDescription>
       </CardHeader>
       <CardContent>
         <form
+          noValidate
           className="grid gap-5"
-          onSubmit={(event) => {
+          onSubmit={async (event) => {
             event.preventDefault();
-            submit({ device_id: device.id, purpose, capabilities: selected });
+            setAttempted(true);
+            if (purposeError || selected.length === 0 || busy) return;
+            await submit({ device_id: device.id, purpose: purposeValue, capabilities: selected });
           }}
         >
-          <Field>
+          <Field data-invalid={attempted && Boolean(purposeError)}>
             <FieldLabel htmlFor="session-purpose">Purpose</FieldLabel>
             <Textarea
               id="session-purpose"
-              minLength={3}
               maxLength={256}
-              required
+              aria-invalid={attempted && Boolean(purposeError)}
               rows={2}
               placeholder="What do you need to do on this phone?"
               value={purpose}
               onChange={(event) => setPurpose(event.target.value)}
             />
+            {attempted && purposeError ? (
+              <FieldError>{purposeError}</FieldError>
+            ) : (
+              <FieldDescription>Use 3–256 characters and avoid sharing sensitive details.</FieldDescription>
+            )}
           </Field>
-          <fieldset className="grid gap-3">
+          <fieldset className="grid gap-3" aria-invalid={attempted && selected.length === 0}>
             <legend className="text-sm font-medium">Requested capabilities</legend>
             <p className="text-sm text-muted-foreground">Select the smallest set needed for this task.</p>
-            <div className="grid gap-2 sm:grid-cols-2">
+            {options.length > 0 ? (
+              <div className="grid gap-2 sm:grid-cols-2">
               {options.map((cap) => (
                 <Field key={cap} orientation="horizontal" className="items-center rounded-lg border p-3">
                   <Checkbox
@@ -1243,11 +1604,22 @@ function StartForm({
                   <FieldLabel className="font-normal">{labels[cap] || cap}</FieldLabel>
                 </Field>
               ))}
-            </div>
+              </div>
+            ) : (
+              <Alert variant="destructive">
+                <AlertCircle />
+                <AlertTitle>No session capabilities are available</AlertTitle>
+                <AlertDescription>Review device enrollment and reconnect the phone before requesting access.</AlertDescription>
+              </Alert>
+            )}
+            {attempted && selected.length === 0 && options.length > 0 && (
+              <FieldError>Select at least one capability.</FieldError>
+            )}
           </fieldset>
           <div>
-            <Button disabled={busy || selected.length === 0}>
-              Request access <ArrowRight data-icon="inline-end" />
+            <Button disabled={busy || options.length === 0}>
+              {busy ? 'Sending request…' : 'Request access'}
+              {!busy && <ArrowRight data-icon="inline-end" />}
             </Button>
           </div>
         </form>

@@ -69,6 +69,7 @@ func TestMigratePersistedCompanionPairingState(t *testing.T) {
 	}
 	statement := "CREATE TABLE mobile_use_schema_migrations (version INTEGER PRIMARY KEY);" +
 		"INSERT INTO mobile_use_schema_migrations(version) VALUES (1);" +
+		"CREATE TABLE audit (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, occurred_at BIGINT NOT NULL, payload TEXT NOT NULL);" +
 		"CREATE TABLE companion_pairings (digest TEXT PRIMARY KEY, workspace TEXT NOT NULL, owner TEXT NOT NULL, expires_at BIGINT NOT NULL);" +
 		"INSERT INTO companion_pairings(digest,workspace,owner,expires_at) VALUES ('legacy-digest','legacy-workspace','owner',9999999999999);"
 	_, err = db.Exec(statement)
@@ -90,8 +91,8 @@ func TestMigratePersistedCompanionPairingState(t *testing.T) {
 	if err := opened.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM mobile_use_schema_migrations").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Fatalf("schema version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("schema version = %d, want 3", version)
 	}
 	var count int
 	if err := opened.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM companion_pairings").Scan(&count); err != nil {

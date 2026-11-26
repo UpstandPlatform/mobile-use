@@ -104,6 +104,51 @@ func TestCompanionAutoEnrollAndPairingStatus(t *testing.T) {
 	}
 }
 
+func TestConsoleSessionRequestAppearsInPairedPhoneHeartbeat(t *testing.T) {
+	f := setup(t)
+	pairing := request[map[string]any](t, f.owner, http.MethodPost, "/v1/companion/pairing", map[string]any{
+		"auto_enroll": true,
+	})
+	opening := []byte(wire.Marshal(map[string]string{
+		"code":  pairing["code"].(string),
+		"label": "Approval feed phone",
+	}))
+	var enrolled struct {
+		DeviceID     string `json:"device_id"`
+		Token        string `json:"token"`
+		AutoEnrolled bool   `json:"auto_enrolled"`
+	}
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, http.StatusCreated), &enrolled); err != nil {
+		t.Fatal(err)
+	}
+	if !enrolled.AutoEnrolled {
+		t.Fatal("test companion did not auto-enroll")
+	}
+	deviceID, phoneToken := enrolled.DeviceID, enrolled.Token
+	phonePost(t, f.origin, phoneToken, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), http.StatusOK)
+
+	// The console and CLI both create sessions through this authenticated API route.
+	session := request[wire.Session](t, f.owner, http.MethodPost, "/v1/sessions", wire.StartSession{
+		DeviceID: deviceID, Purpose: "Verify console approval notification", Capabilities: []wire.Capability{wire.Screen},
+	})
+	if session.State != wire.Pending {
+		t.Fatalf("new access request state = %q, want %q", session.State, wire.Pending)
+	}
+
+	var heartbeat struct {
+		Sessions []wire.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(phonePost(t, f.origin, phoneToken, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), http.StatusOK), &heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	for _, pending := range heartbeat.Sessions {
+		if pending.ID == session.ID && pending.DeviceID == deviceID && pending.State == wire.Pending {
+			return
+		}
+	}
+	t.Fatalf("paired phone heartbeat did not include the console request %q: %+v", session.ID, heartbeat.Sessions)
+}
+
 func TestCompanionPairingSurvivesRestartAndCanBeCancelled(t *testing.T) {
 	f := setup(t)
 	actor := wire.Actor{Workspace: f.workspace, Subject: "owner", Role: wire.Admin}

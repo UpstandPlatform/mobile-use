@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -220,6 +221,28 @@ func (s *Service) HTTP(options HTTPOptions) http.Handler {
 		events, err := s.Store.Audit(r.Context(), actor, 100)
 		respond(w, 200, events, err)
 	}))
+	protected.HandleFunc("GET /v1/audit/page", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+		page := 1
+		if value := r.URL.Query().Get("page"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 1 {
+				writeError(w, wire.Error("INVALID_PAGINATION", "Page must be a positive integer.", 400))
+				return
+			}
+			page = parsed
+		}
+		pageSize := 25
+		if value := r.URL.Query().Get("page_size"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 1 {
+				writeError(w, wire.Error("INVALID_PAGINATION", "Page size must be a positive integer no greater than 100.", 400))
+				return
+			}
+			pageSize = parsed
+		}
+		result, err := s.Store.AuditPage(r.Context(), actor, page, pageSize)
+		respond(w, 200, result, err)
+	}))
 	protected.HandleFunc("GET /v1/metrics", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		if actor.Role != wire.Admin && actor.Role != wire.Auditor {
 			writeError(w, wire.ErrForbidden)
@@ -288,7 +311,10 @@ func perimeterHosts(next http.Handler, origins []string, tokenEndpoint string) h
 	if endpoint, err := url.Parse(tokenEndpoint); err == nil && endpoint.Scheme == "https" && endpoint.Host != "" {
 		connect += " https://" + endpoint.Host
 	}
-	csp := "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src " + connect + "; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+	// React and the shadcn sidebar/QR/toast primitives set trusted style attributes
+	// for runtime layout values. Keep style elements same-origin and allow only attributes;
+	// scripts remain strictly self-hosted with no inline execution permission.
+	csp := "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src " + connect + "; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")

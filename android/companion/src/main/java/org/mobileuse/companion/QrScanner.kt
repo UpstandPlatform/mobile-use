@@ -33,6 +33,7 @@ import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 @Composable
 fun QrScannerScreen(
@@ -50,8 +51,17 @@ fun QrScannerScreen(
         }
     }
 
+    // The camera is bound to the Activity lifecycle, so it must be unbound explicitly when the
+    // scanner leaves composition; otherwise it keeps running and feeds a shut-down executor.
+    val cameraProvider = remember { AtomicReference<ProcessCameraProvider?>(null) }
+    val disposed = remember { AtomicBoolean(false) }
+
     DisposableEffect(Unit) {
-        onDispose { analyzerExecutor.shutdown() }
+        onDispose {
+            disposed.set(true)
+            cameraProvider.getAndSet(null)?.let { runCatching { it.unbindAll() } }
+            analyzerExecutor.shutdown()
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -62,6 +72,8 @@ fun QrScannerScreen(
                 val future = ProcessCameraProvider.getInstance(ctx)
                 future.addListener({
                     val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
+                    if (disposed.get()) return@addListener
+                    cameraProvider.set(provider)
                     val preview = Preview.Builder().build().also {
                         it.surfaceProvider = previewView.surfaceProvider
                     }

@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -345,10 +346,24 @@ class MainActivity : ComponentActivity() {
         var showAdvanced by rememberSaveable { mutableStateOf(false) }
         var confirmDisconnect by remember { mutableStateOf(false) }
 
-        val colors = lightColorScheme(
+        val colors = if (isSystemInDarkTheme()) darkColorScheme(
+            primary = Color(0xFFC1E49F),
+            onPrimary = Color(0xFF26391B),
+            primaryContainer = Color(0xFF354B28),
+            onPrimaryContainer = Color(0xFFE0F4C9),
+            secondaryContainer = Color(0xFF394633),
+            onSecondaryContainer = Color(0xFFD9E7CA),
+            background = Color(0xFF1D211A),
+            surface = Color(0xFF1D211A),
+            surfaceVariant = Color(0xFF43483B),
+            onSurfaceVariant = Color(0xFFC4CABB),
+        ) else lightColorScheme(
             primary = Color(0xFF405B30),
+            onPrimary = Color(0xFFFFFFFF),
             primaryContainer = Color(0xFFD7ED99),
             onPrimaryContainer = Color(0xFF243419),
+            secondaryContainer = Color(0xFFE3EBD9),
+            onSecondaryContainer = Color(0xFF2D3C24),
             background = Color(0xFFF5F5EF),
             surface = Color(0xFFFDFDF8),
         )
@@ -367,15 +382,36 @@ class MainActivity : ComponentActivity() {
 
             Surface(modifier = Modifier.fillMaxSize(), color = colors.background) {
               Box(Modifier.fillMaxSize().safeDrawingPadding().imePadding(), contentAlignment = Alignment.TopCenter) {
-                Column(Modifier.widthIn(max = 480.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Column(Modifier.widthIn(max = 520.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Image(painterResource(R.drawable.mobile_use_icon), null, Modifier.size(36.dp))
-                        Text("mobile-use", style = MaterialTheme.typography.titleMedium)
+                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text("mobile-use", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text("Phone companion", style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+                        }
                     }
 
                     if (pairing == null) {
-                        Text("Pair your phone", style = MaterialTheme.typography.headlineSmall)
-                        Text("Scan the QR code in the desktop console or CLI, or pick a computer on your Wi-Fi network.", color = colors.onSurfaceVariant)
+                        ElevatedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.elevatedCardColors(containerColor = colors.primaryContainer),
+                        ) {
+                            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Text("Connect to your workspace", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Pair once to let your computer request screen sharing and approved sensors. Your phone stays in control of each permission.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    listOf("QR code", "Same Wi-Fi", "Remote HTTPS").forEach { label ->
+                                        Surface(color = colors.surface.copy(alpha = 0.72f), shape = MaterialTheme.shapes.small) {
+                                            Text(label, Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, color = colors.onSurface)
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         val qrReq = pendingQr
                         if (qrReq != null) {
@@ -421,7 +457,7 @@ class MainActivity : ComponentActivity() {
                             enabled = !busy,
                             modifier = Modifier.fillMaxWidth(),
                             onClick = ::launchQrScanner,
-                        ) { Text("Scan QR code") }
+                        ) { Text(if (busy) "Connecting…" else "Scan pairing QR code") }
 
                         val picked = selectedHost
                         if (picked != null) {
@@ -468,15 +504,21 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         } else {
-                            Text("Nearby on Wi-Fi", style = MaterialTheme.typography.titleSmall)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text("Nearby on Wi-Fi", style = MaterialTheme.typography.titleMedium)
+                                    Text("No address or network setup needed on the same network.", style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
+                                }
+                                Surface(color = colors.secondaryContainer, shape = MaterialTheme.shapes.small) {
+                                    Text("Local", Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, color = colors.onSecondaryContainer)
+                                }
+                            }
                             if (discoveredHosts.isEmpty()) {
                                 OutlinedCard(Modifier.fillMaxWidth()) {
-                                    Text(
-                                        "Looking for computers running mobile-use on your Wi-Fi network…",
-                                        color = colors.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        modifier = Modifier.padding(16.dp),
-                                    )
+                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Text("Searching for your computer…", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                        Text("Keep mobile-use open on the computer and connect both devices to the same Wi-Fi. For remote servers, use the address option below.", color = colors.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                                    }
                                 }
                             } else {
                                 discoveredHosts.forEach { host ->
@@ -509,7 +551,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         TextButton(onClick = { showManual = !showManual }) {
-                            Text(if (showManual) "Hide manual / remote setup" else "Enter address & code manually (or remote server)")
+                            Text(if (showManual) "Hide server address setup" else "Pair with a server address or remote workspace")
                         }
 
                         if (showManual) {
@@ -584,13 +626,26 @@ class MainActivity : ComponentActivity() {
                         val hostTitle = activePairing.hostName.ifEmpty {
                             runCatching { URI(activePairing.origin).host }.getOrDefault(activePairing.origin)
                         }
-                        Text(if (online) "Connected" else "Waiting for connection", style = MaterialTheme.typography.headlineSmall)
-                        Text(
-                            "$hostTitle · ${if (activePairing.mode == "lan") "Local Wi-Fi" else "Remote HTTPS"}",
-                            color = colors.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        if (status.sessions.isEmpty()) Text("Sharing requests from your console will appear here.", color = colors.onSurfaceVariant)
+                        ElevatedCard(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.elevatedCardColors(containerColor = if (online) colors.primaryContainer else colors.surfaceContainerLow),
+                        ) {
+                            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text(if (online) "Phone connected" else "Waiting for computer", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                                    Surface(color = if (online) colors.secondaryContainer else colors.surface, shape = MaterialTheme.shapes.small) {
+                                        Text(if (online) "Online" else "Reconnecting", Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, color = if (online) colors.onSecondaryContainer else colors.onSurfaceVariant)
+                                    }
+                                }
+                                Text("$hostTitle · ${if (activePairing.mode == "lan") "Local Wi-Fi" else "Remote HTTPS"}", color = colors.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    if (status.sessions.isEmpty()) "When you request a session in the console, review it here before sharing your screen or sensors."
+                                    else "Review each request below. Screen and sensor permissions are approved on this phone.",
+                                    color = colors.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
                         status.sessions.forEach { item ->
                             OutlinedCard(Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Spinner } from '@/components/ui/spinner';
 
 function gather(connection: RTCPeerConnection) {
   if (connection.iceGatheringState === 'complete') return Promise.resolve();
@@ -42,9 +44,15 @@ export function LiveVideo({ token, path }: { token: string; path: string }) {
 
     const start = async () => {
       try {
-        const config = await api<{ ice_servers: RTCIceServer[]; ice_transport_policy: RTCIceTransportPolicy }>(token, path);
+        const config = await api<{
+          ice_servers: RTCIceServer[];
+          ice_transport_policy: RTCIceTransportPolicy;
+        }>(token, path);
         if (!active) return;
-        peer = new RTCPeerConnection({ iceServers: config.ice_servers, iceTransportPolicy: config.ice_transport_policy });
+        peer = new RTCPeerConnection({
+          iceServers: config.ice_servers,
+          iceTransportPolicy: config.ice_transport_policy,
+        });
         peer.addTransceiver('video', { direction: 'recvonly' });
         peer.ontrack = ({ streams, track }) => {
           if (active && video) video.srcObject = streams[0] ?? new MediaStream([track]);
@@ -55,9 +63,17 @@ export function LiveVideo({ token, path }: { token: string; path: string }) {
         await peer.setLocalDescription(await peer.createOffer());
         await gather(peer);
         if (!active || !peer.localDescription) return;
-        const response = await api<{ viewer_id: string; answer: RTCSessionDescriptionInit }>(token, path, 'POST', peer.localDescription.toJSON());
+        const response = await api<{ viewer_id: string; answer: RTCSessionDescriptionInit }>(
+          token,
+          path,
+          'POST',
+          peer.localDescription.toJSON(),
+        );
         viewerID = response.viewer_id;
-        if (!active) { disconnect(); return; }
+        if (!active) {
+          disconnect();
+          return;
+        }
         await peer.setRemoteDescription(response.answer);
       } catch (error) {
         if (!active) return;
@@ -76,9 +92,29 @@ export function LiveVideo({ token, path }: { token: string; path: string }) {
     };
   }, [token, path]);
 
-  return <div className="live-panel">
-    {!loaded && <div className="live-status" role="status">{failure || 'Connecting to the phone…'}</div>}
-    {loaded && failure && <div className="live-status" role="status">{failure}</div>}
-    <video ref={screen} hidden={!loaded} aria-label="Live phone video" autoPlay muted playsInline onLoadedData={() => setLoaded(true)} />
-  </div>;
+  return (
+    <div className="grid min-h-64 w-full place-items-center gap-3">
+      {!loaded && !failure && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+          <Spinner />
+          Connecting to the phone…
+        </div>
+      )}
+      {failure && (
+        <Alert variant="destructive" className="max-w-lg">
+          <AlertDescription>{failure}</AlertDescription>
+        </Alert>
+      )}
+      <video
+        className="max-h-[min(72vh,56rem)] max-w-full rounded-md object-contain"
+        ref={screen}
+        hidden={!loaded}
+        aria-label="Live phone video"
+        autoPlay
+        muted
+        playsInline
+        onLoadedData={() => setLoaded(true)}
+      />
+    </div>
+  );
 }

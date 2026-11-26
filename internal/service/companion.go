@@ -45,24 +45,7 @@ type Companion struct {
 	frames    map[string]phoneFrame
 	frameSubs map[string]map[chan frameEvent]struct{}
 	requests  map[string]sensorEntry
-	pairings  map[string]*pairingRecord
-	byCode    map[string]string
 	attempts  map[string][]time.Time
-}
-
-type pairingRecord struct {
-	ID           string
-	Workspace    string
-	Owner        string
-	Creator      wire.Actor
-	CodeHash     string
-	ExpiresAt    time.Time
-	AutoEnroll   bool
-	GrantAgents  []string
-	State        string
-	DeviceID     string
-	Label        string
-	AutoEnrolled bool
 }
 
 type phoneFrame struct {
@@ -93,8 +76,6 @@ func NewCompanion(db *store.Store, origin string) *Companion {
 		frames:         make(map[string]phoneFrame),
 		frameSubs:      make(map[string]map[chan frameEvent]struct{}),
 		requests:       make(map[string]sensorEntry),
-		pairings:       make(map[string]*pairingRecord),
-		byCode:         make(map[string]string),
 		attempts:       make(map[string][]time.Time),
 	}
 }
@@ -104,14 +85,16 @@ func hashToken(token string) string {
 	return hex.EncodeToString(data[:])
 }
 
-func generatePairingCode() string {
+func generatePairingCode() (string, error) {
 	var raw [8]byte
-	_, _ = rand.Read(raw[:])
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
 	var out [8]byte
 	for i := range out {
 		out[i] = pairingAlphabet[int(raw[i])&31]
 	}
-	return string(out[:4]) + "-" + string(out[4:])
+	return string(out[:4]) + "-" + string(out[4:]), nil
 }
 
 // NormalizePairingCode validates and canonicalizes an 8-character pairing code or legacy 32-char hex code.
@@ -218,32 +201,21 @@ func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin stri
 				return
 			}
 		}
-		formattedCode := generatePairingCode()
+		formattedCode, err := generatePairingCode()
+		if err != nil {
+			writeError(w, wire.Error("PAIRING_UNAVAILABLE", "A secure pairing code could not be generated. Try again.", 500))
+			return
+		}
 		normalizedCode, _ := NormalizePairingCode(formattedCode)
 		codeHash := hashToken(normalizedCode)
 		now := time.Now()
 		expiry := now.Add(5 * time.Minute)
-		if err := c.Store.PairCompanion(r.Context(), actor, codeHash, expiry); err != nil {
+		id := wire.NewID()
+		autoEnroll := req.AutoEnroll && actor.CanManage()
+		if err := c.Store.PairCompanion(r.Context(), actor, id, codeHash, expiry, autoEnroll, req.GrantAgents); err != nil {
 			writeError(w, err)
 			return
 		}
-		id := wire.NewID()
-		c.mu.Lock()
-		c.ensureMapsLocked()
-		c.sweepLocked(now)
-		c.pairings[id] = &pairingRecord{
-			ID:          id,
-			Workspace:   actor.Workspace,
-			Owner:       actor.Subject,
-			Creator:     actor,
-			CodeHash:    codeHash,
-			ExpiresAt:   expiry,
-			AutoEnroll:  req.AutoEnroll,
-			GrantAgents: req.GrantAgents,
-			State:       "waiting",
-		}
-		c.byCode[codeHash] = id
-		c.mu.Unlock()
 
 		mode := c.Mode
 		if mode == "" {
@@ -263,35 +235,33 @@ func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin stri
 			"host_name":   c.HostName,
 			"qr_uri":      BuildPairingURI(selectedOrigin, formattedCode, c.CertFingerprint, c.HostName, mode),
 			"expires_at":  expiry,
-			"auto_enroll": req.AutoEnroll && actor.CanManage(),
+			"auto_enroll": autoEnroll,
 		})
 	}), origin))
 	router.Handle("GET /v1/companion/pairing/{id}", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
-		id := r.PathValue("id")
-		now := time.Now()
-		c.mu.Lock()
-		c.ensureMapsLocked()
-		c.sweepLocked(now)
-		record, ok := c.pairings[id]
-		if !ok || record.Workspace != actor.Workspace || (!actor.CanManage() && actor.Subject != record.Owner) {
-			c.mu.Unlock()
-			writeError(w, wire.ErrNotFound)
+		pairing, err := c.Store.CompanionPairing(r.Context(), actor, r.PathValue("id"), time.Now())
+		if err != nil {
+			writeError(w, err)
 			return
 		}
-		state := record.State
-		if state == "waiting" && !now.Before(record.ExpiresAt) {
-			state = "expired"
-		}
 		resp := map[string]any{
-			"id":            record.ID,
-			"state":         state,
-			"device_id":     record.DeviceID,
-			"label":         record.Label,
-			"auto_enrolled": record.AutoEnrolled,
-			"expires_at":    record.ExpiresAt,
+			"id":                pairing.ID,
+			"state":             pairing.State,
+			"device_id":         pairing.DeviceID,
+			"label":             pairing.Label,
+			"auto_enroll":       pairing.AutoEnroll,
+			"auto_enrolled":     pairing.AutoEnrolled,
+			"auto_enroll_error": pairing.AutoEnrollError,
+			"expires_at":        pairing.ExpiresAt,
 		}
-		c.mu.Unlock()
 		writeJSON(w, 200, resp)
+	}), origin))
+	router.Handle("DELETE /v1/companion/pairing/{id}", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+		if err := c.Store.CancelCompanionPairing(r.Context(), actor, r.PathValue("id"), time.Now()); err != nil {
+			writeError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}), origin))
 	router.Handle("DELETE /v1/companion/{id}", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		id := r.PathValue("id")
@@ -350,49 +320,24 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 			return
 		}
 		normalizedCode, ok := NormalizePairingCode(req.Code)
-		if !ok || len(req.Label) < 1 || len(req.Label) > 80 {
+		label := strings.TrimSpace(req.Label)
+		if !ok || len(label) < 1 || len(label) > 80 {
 			writeError(w, wire.Error("INVALID_PAIRING", "Provide a valid pairing code and device name.", 400))
 			return
 		}
 		codeHash := hashToken(normalizedCode)
 		token := wire.NewID() + wire.NewID()
-		phone, err := c.Store.EnrollCompanion(r.Context(), codeHash, hashToken(token), req.Label, now)
+		phone, err := c.Store.EnrollCompanion(r.Context(), codeHash, hashToken(token), label, now)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		caps := wire.Capabilities{wire.Screen: true, wire.Camera: true, wire.Microphone: true}
-		_ = c.Store.Register(r.Context(), phone.Workspace, phoneConnector(phone.ID), []wire.Inventory{{
-			ID:           phone.ID,
-			Label:        phone.Label,
-			Platform:     "android",
-			Mode:         "companion",
-			Capabilities: caps,
-		}}, now)
-
-		var autoEnroll bool
-		var creator wire.Actor
-		var grantAgents []string
-		var recordID string
-		c.mu.Lock()
-		c.ensureMapsLocked()
-		if id, exists := c.byCode[codeHash]; exists {
-			recordID = id
-			if rec := c.pairings[id]; rec != nil {
-				autoEnroll = rec.AutoEnroll
-				creator = rec.Creator
-				grantAgents = append([]string(nil), rec.GrantAgents...)
-				rec.State = "paired"
-				rec.DeviceID = phone.ID
-				rec.Label = phone.Label
-			}
-			delete(c.byCode, codeHash)
-		}
-		c.mu.Unlock()
-
 		autoEnrolled := false
+		autoEnrollError := ""
+		creator := wire.Actor{Workspace: phone.Workspace, Subject: phone.Owner, Role: phone.Pairing.CreatorRole}
+		autoEnroll := phone.Pairing.AutoEnroll
 		if autoEnroll && creator.CanManage() {
-			subjects := grantAgents
+			subjects := phone.Pairing.GrantAgents
 			if len(subjects) == 0 && phone.Workspace == "local" {
 				subjects = []string{"local-agent"}
 			}
@@ -414,18 +359,21 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 				Enabled: &enabled,
 			}, now); err == nil {
 				autoEnrolled = true
+			} else {
+				autoEnrollError = wire.Public(err).Message
 			}
-		}
-		if recordID != "" && autoEnrolled {
-			c.mu.Lock()
-			if rec := c.pairings[recordID]; rec != nil {
-				rec.AutoEnrolled = true
+			if err := c.Store.MarkCompanionAutoEnroll(r.Context(), creator, phone.Pairing.ID, autoEnrolled, autoEnrollError); err != nil {
+				if autoEnrollError == "" {
+					autoEnrollError = "Enrollment succeeded, but its status could not be saved. Review this device in the console."
+				}
 			}
-			c.mu.Unlock()
 		}
 		resp := map[string]any{"token": token, "device_id": phone.ID}
 		if autoEnrolled {
 			resp["auto_enrolled"] = true
+		}
+		if autoEnrollError != "" {
+			resp["auto_enroll_error"] = autoEnrollError
 		}
 		writeJSON(w, 201, resp)
 	})
@@ -534,12 +482,6 @@ func (c *Companion) ensureMapsLocked() {
 	}
 	if c.requests == nil {
 		c.requests = make(map[string]sensorEntry)
-	}
-	if c.pairings == nil {
-		c.pairings = make(map[string]*pairingRecord)
-	}
-	if c.byCode == nil {
-		c.byCode = make(map[string]string)
 	}
 	if c.attempts == nil {
 		c.attempts = make(map[string][]time.Time)
@@ -989,17 +931,6 @@ func (c *Companion) sweepLocked(now time.Time) {
 	for id, entry := range c.requests {
 		if !now.Before(entry.status.ExpiresAt) {
 			delete(c.requests, id)
-		}
-	}
-	retention := now.Add(-15 * time.Minute)
-	for id, rec := range c.pairings {
-		if rec.State == "waiting" && !now.Before(rec.ExpiresAt) {
-			rec.State = "expired"
-			delete(c.byCode, rec.CodeHash)
-		}
-		if rec.ExpiresAt.Before(retention) {
-			delete(c.byCode, rec.CodeHash)
-			delete(c.pairings, id)
 		}
 	}
 }

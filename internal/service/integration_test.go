@@ -77,6 +77,7 @@ type fixture struct {
 	db                    *store.Store
 	owner, agent, foreign *client.Client
 	origin                string
+	workspace             string
 	device                string
 	driver                *fixtureDriver
 	companion             *service.Companion
@@ -148,7 +149,7 @@ func setupFleet(t *testing.T, deviceCount int) fixture {
 	owner, _ := client.New(origin, tokenOwner)
 	worker, _ := client.New(origin, tokenAgent)
 	foreign, _ := client.New(origin, "other-workspace-test-token")
-	return fixture{db, owner, worker, foreign, origin, devices[0].ID, driver, companion}
+	return fixture{db: db, owner: owner, agent: worker, foreign: foreign, origin: origin, workspace: workspace, device: devices[0].ID, driver: driver, companion: companion}
 }
 
 func request[T any](t *testing.T, c *client.Client, method, path string, body any) T {

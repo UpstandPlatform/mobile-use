@@ -66,9 +66,18 @@ CREATE TABLE IF NOT EXISTS connector_routes (
 
 CREATE TABLE IF NOT EXISTS companion_pairings (
     digest TEXT PRIMARY KEY,
+    id TEXT NOT NULL DEFAULT '',
     workspace TEXT NOT NULL,
     owner TEXT NOT NULL,
-    expires_at BIGINT NOT NULL
+    creator_role TEXT NOT NULL DEFAULT 'owner',
+    expires_at BIGINT NOT NULL,
+    auto_enroll INTEGER NOT NULL DEFAULT 0,
+    grant_agents TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT 'waiting',
+    device TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '',
+    auto_enrolled INTEGER NOT NULL DEFAULT 0,
+    auto_enroll_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS companions (

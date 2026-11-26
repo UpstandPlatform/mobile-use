@@ -21,7 +21,7 @@ import (
 var schema string
 
 const (
-	schemaVersion  = 1
+	schemaVersion  = 2
 	ConnectorTTL   = 10 * time.Second
 	PresenceTTL    = 15 * time.Second
 	IdleTimeout    = 5 * time.Minute
@@ -75,32 +75,55 @@ func (s *Store) migrate(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(73654129)"); err != nil {
 				return err
 			}
+			if _, err := tx.ExecContext(ctx, "SELECT set_config('mobile_use.workspace','',true), set_config('mobile_use.system','true',true)"); err != nil {
+				return err
+			}
 		}
 		current, err := s.currentSchemaVersion(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if current >= schemaVersion {
-			return nil
-		}
-		for _, statement := range strings.Split(schema, ";") {
-			if strings.TrimSpace(statement) == "" {
-				continue
+		if current < 1 {
+			for _, statement := range strings.Split(schema, ";") {
+				if strings.TrimSpace(statement) == "" {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, statement); err != nil {
+					return err
+				}
 			}
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
+			if err := s.ensureDeviceRemovedColumn(ctx, tx); err != nil {
+				return err
+			}
+			if s.postgres {
+				if err := activateRLS(ctx, tx); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), 1); err != nil {
+				return err
+			}
+			current = 1
+		}
+		if current < schemaVersion {
+			if err := s.ensureCompanionPairingColumns(ctx, tx); err != nil {
+				return err
+			}
+			// Pairing codes issued before pairing state was durable cannot be tracked safely after restart.
+			if _, err := tx.ExecContext(ctx, "DELETE FROM companion_pairings"); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS companion_pairings_id ON companion_pairings(id)"); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS companion_pairings_owner_state ON companion_pairings(workspace, owner, state, expires_at)"); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), schemaVersion); err != nil {
 				return err
 			}
 		}
-		if err := s.ensureDeviceRemovedColumn(ctx, tx); err != nil {
-			return err
-		}
-		if s.postgres {
-			if err := activateRLS(ctx, tx); err != nil {
-				return err
-			}
-		}
-		_, err = tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), schemaVersion)
-		return err
+		return nil
 	})
 }
 
@@ -155,6 +178,65 @@ func (s *Store) ensureDeviceRemovedColumn(ctx context.Context, tx *sql.Tx) error
 	}
 	_, err = tx.ExecContext(ctx, "ALTER TABLE devices ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
 	return err
+}
+
+func (s *Store) ensureCompanionPairingColumns(ctx context.Context, tx *sql.Tx) error {
+	columns := []struct {
+		name    string
+		typeDef string
+	}{
+		{"id", "TEXT NOT NULL DEFAULT ''"},
+		{"creator_role", "TEXT NOT NULL DEFAULT 'owner'"},
+		{"auto_enroll", "INTEGER NOT NULL DEFAULT 0"},
+		{"grant_agents", "TEXT NOT NULL DEFAULT '[]'"},
+		{"state", "TEXT NOT NULL DEFAULT 'waiting'"},
+		{"device", "TEXT NOT NULL DEFAULT ''"},
+		{"label", "TEXT NOT NULL DEFAULT ''"},
+		{"auto_enrolled", "INTEGER NOT NULL DEFAULT 0"},
+		{"auto_enroll_error", "TEXT NOT NULL DEFAULT ''"},
+	}
+	if s.postgres {
+		for _, column := range columns {
+			statement := "ALTER TABLE companion_pairings ADD COLUMN IF NOT EXISTS " + column.name + " " + column.typeDef
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(companion_pairings)")
+	if err != nil {
+		return err
+	}
+	found := make(map[string]bool, len(columns))
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range columns {
+		if found[column.name] {
+			continue
+		}
+		statement := "ALTER TABLE companion_pairings ADD COLUMN " + column.name + " " + column.typeDef
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) query(statement string) string {
@@ -1008,7 +1090,7 @@ func (s *Store) Prune(ctx context.Context, now time.Time) error {
 			age   time.Duration
 		}{
 			{"DELETE FROM viewers WHERE expires_at < ?", 0},
-			{"DELETE FROM companion_pairings WHERE expires_at < ?", 0},
+			{"DELETE FROM companion_pairings WHERE expires_at < ?", 15 * time.Minute},
 			{"DELETE FROM operations WHERE updated_at < ?", 24 * time.Hour},
 			{"DELETE FROM audit WHERE occurred_at < ?", 90 * 24 * time.Hour},
 			{"DELETE FROM sessions WHERE state NOT IN ('active','pending_approval') AND expires_at < ? AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.session_id = sessions.id)", 90 * 24 * time.Hour},

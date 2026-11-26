@@ -96,10 +96,12 @@ export type PairingSession = {
 };
 export type PairingStatus = {
   id: string;
-  state: 'waiting' | 'paired' | 'expired';
+  state: 'waiting' | 'paired' | 'expired' | 'cancelled';
   device_id?: string;
   label?: string;
+  auto_enroll?: boolean;
   auto_enrolled?: boolean;
+  auto_enroll_error?: string;
   expires_at: string;
 };
 export type WirelessAdbService = { name: string; type: 'pairing' | 'connect'; address: string };

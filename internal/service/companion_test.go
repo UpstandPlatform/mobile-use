@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"mobile-use/internal/client"
 	"mobile-use/internal/service"
 	"mobile-use/internal/store"
 	"mobile-use/internal/wire"
@@ -66,7 +67,7 @@ func TestCompanionAutoEnrollAndPairingStatus(t *testing.T) {
 	}
 
 	status := request[map[string]any](t, f.owner, "GET", "/v1/companion/pairing/"+pairID, nil)
-	if status["state"] != "waiting" {
+	if status["state"] != "waiting" || status["auto_enroll"] != true {
 		t.Fatalf("expected waiting state, got %+v", status)
 	}
 
@@ -85,9 +86,10 @@ func TestCompanionAutoEnrollAndPairingStatus(t *testing.T) {
 
 	// Status should transition to paired.
 	status = request[map[string]any](t, f.owner, "GET", "/v1/companion/pairing/"+pairID, nil)
-	if status["state"] != "paired" || status["device_id"] != deviceID || status["auto_enrolled"] != true {
+	if status["state"] != "paired" || status["device_id"] != deviceID || status["auto_enroll"] != true || status["auto_enrolled"] != true {
 		t.Fatalf("unexpected paired status: %+v", status)
 	}
+	phonePost(t, f.origin, "", "/companion/enroll", "application/json", body, http.StatusForbidden)
 
 	// Agent should immediately see the auto-enrolled device without extra PUT /v1/devices/{id}.
 	agentDevices := request[[]wire.Device](t, f.agent, "GET", "/v1/devices", nil)
@@ -100,6 +102,68 @@ func TestCompanionAutoEnrollAndPairingStatus(t *testing.T) {
 	if !found {
 		t.Fatalf("auto-enrolled companion not visible to granted agent: %+v", agentDevices)
 	}
+}
+
+func TestCompanionPairingSurvivesRestartAndCanBeCancelled(t *testing.T) {
+	f := setup(t)
+	actor := wire.Actor{Workspace: f.workspace, Subject: "owner", Role: wire.Admin}
+	newCompanionServer := func() (*httptest.Server, *client.Client) {
+		t.Helper()
+		auth := &service.Auth{Static: []service.Principal{{Token: tokenOwner, Actor: actor}}}
+		companion := service.NewCompanion(f.db, f.origin)
+		mux := http.NewServeMux()
+		companion.ConsoleRoutes(mux, auth, f.origin)
+		companion.PhoneRoutes(mux)
+		server := httptest.NewServer(mux)
+		owner, err := client.New(server.URL, tokenOwner)
+		if err != nil {
+			server.Close()
+			t.Fatal(err)
+		}
+		return server, owner
+	}
+
+	first, owner := newCompanionServer()
+	created := request[map[string]any](t, owner, "POST", "/v1/companion/pairing", map[string]any{
+		"auto_enroll":  true,
+		"grant_agents": []string{"agent"},
+	})
+	first.Close()
+
+	restarted, ownerAfterRestart := newCompanionServer()
+	defer restarted.Close()
+	pairingID := created["id"].(string)
+	status := request[map[string]any](t, ownerAfterRestart, "GET", "/v1/companion/pairing/"+pairingID, nil)
+	if status["state"] != "waiting" {
+		t.Fatalf("pairing state after service restart = %v, want waiting", status["state"])
+	}
+
+	var enrolled map[string]any
+	raw := phonePost(t, restarted.URL, "", "/companion/enroll", "application/json", []byte(wire.Marshal(map[string]string{
+		"code": created["code"].(string), "label": "Restarted pairing phone",
+	})), http.StatusCreated)
+	if err := json.Unmarshal(raw, &enrolled); err != nil {
+		t.Fatal(err)
+	}
+	if enrolled["auto_enrolled"] != true {
+		t.Fatalf("auto-enrollment did not complete after restart: %+v", enrolled)
+	}
+	status = request[map[string]any](t, ownerAfterRestart, "GET", "/v1/companion/pairing/"+pairingID, nil)
+	if status["state"] != "paired" || status["device_id"] != enrolled["device_id"] || status["auto_enrolled"] != true {
+		t.Fatalf("pairing status was not durable: %+v", status)
+	}
+
+	cancelled := request[map[string]any](t, ownerAfterRestart, "POST", "/v1/companion/pairing", nil)
+	if err := ownerAfterRestart.Request(t.Context(), "DELETE", "/v1/companion/pairing/"+cancelled["id"].(string), nil, nil); err != nil {
+		t.Fatalf("cancel pairing: %v", err)
+	}
+	status = request[map[string]any](t, ownerAfterRestart, "GET", "/v1/companion/pairing/"+cancelled["id"].(string), nil)
+	if status["state"] != "cancelled" {
+		t.Fatalf("cancelled pairing state = %v, want cancelled", status["state"])
+	}
+	phonePost(t, restarted.URL, "", "/companion/enroll", "application/json", []byte(wire.Marshal(map[string]string{
+		"code": cancelled["code"].(string), "label": "Should not enroll",
+	})), http.StatusForbidden)
 }
 
 func TestCompanionMultiOriginPhoneHandlerAndRateLimit(t *testing.T) {

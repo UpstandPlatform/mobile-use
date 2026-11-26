@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
   Cable,
@@ -103,7 +103,11 @@ export function AddDevicePanel({
   );
   const [pairLoading, setPairLoading] = useState(false);
   const [pairError, setPairError] = useState('');
+  const [pairStatusError, setPairStatusError] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const pairingRequestRef = useRef(false);
+  const onDeviceAddedRef = useRef(onDeviceAdded);
+  onDeviceAddedRef.current = onDeviceAdded;
   const [adbDiscovery, setAdbDiscovery] = useState<WirelessAdbDiscovery>();
   const [adbScanning, setAdbScanning] = useState(false);
   const [pairAddr, setPairAddr] = useState('');
@@ -115,23 +119,46 @@ export function AddDevicePanel({
 
   const createPairing = useCallback(
     async (originOverride?: string, enrollFlag?: boolean) => {
+      if (pairingRequestRef.current) return;
+      pairingRequestRef.current = true;
       setPairLoading(true);
       setPairError('');
-      setPairStatus(undefined);
+      setPairStatusError('');
+      let previousCancelled = false;
       try {
+        if (pairing?.id) {
+          let previousStatus = pairStatus;
+          if (!previousStatus) {
+            try {
+              previousStatus = await api<PairingStatus>(token, '/v1/companion/pairing/' + pairing.id);
+            } catch {
+              previousStatus = undefined;
+            }
+          }
+          if (previousStatus?.state === 'waiting') {
+            await api<void>(token, '/v1/companion/pairing/' + pairing.id, 'DELETE');
+            previousCancelled = true;
+          }
+        }
         const body: Record<string, unknown> = { auto_enroll: enrollFlag ?? autoEnroll };
         const targetOrigin = originOverride !== undefined ? originOverride : selectedOrigin;
         if (targetOrigin) body.origin = targetOrigin;
         const created = await api<PairingSession>(token, '/v1/companion/pairing', 'POST', body);
         setPairing(created);
+        setPairStatus(undefined);
         if (!targetOrigin && created.origin) setSelectedOrigin(created.origin);
       } catch (err) {
+        if (previousCancelled) {
+          setPairing(undefined);
+          setPairStatus(undefined);
+        }
         setPairError(err instanceof Error ? err.message : 'Could not create pairing code.');
       } finally {
+        pairingRequestRef.current = false;
         setPairLoading(false);
       }
     },
-    [token, autoEnroll, selectedOrigin],
+    [token, autoEnroll, selectedOrigin, pairing, pairStatus],
   );
 
   useEffect(() => {
@@ -140,28 +167,76 @@ export function AddDevicePanel({
   }, [tab, canPairCompanion, pairing, pairLoading, pairError, createPairing]);
 
   useEffect(() => {
-    if (!pairing || pairStatus?.state === 'paired' || pairStatus?.state === 'expired') return;
+    const id = pairing?.id;
+    if (!id) return;
+    return () => {
+      const path = '/v1/companion/pairing/' + id;
+      void api<PairingStatus>(token, path)
+        .then((status) => (status.state === 'waiting' ? api<void>(token, path, 'DELETE') : undefined))
+        .catch(() => undefined);
+    };
+  }, [pairing?.id, token]);
+
+  useEffect(() => {
+    if (!pairing) return;
     let cancelled = false;
-    let reported = false;
-    const timer = window.setInterval(async () => {
-      setNowMs(Date.now());
+    let timer = 0;
+    let failures = 0;
+    let deviceReported = false;
+    let enrollmentReported = false;
+    let enrollmentWasPending = false;
+    const poll = async () => {
       try {
-        const next = await api<PairingStatus>(token, `/v1/companion/pairing/${pairing.id}`);
+        const next = await api<PairingStatus>(token, '/v1/companion/pairing/' + pairing.id);
         if (cancelled) return;
+        failures = 0;
+        setPairStatusError('');
         setPairStatus(next);
-        if (next.state === 'paired' && !reported) {
-          reported = true;
-          await onDeviceAdded(next.device_id);
+        const enrollmentSettled = !next.auto_enroll || next.auto_enrolled || !!next.auto_enroll_error;
+        if (next.state === 'paired' && next.auto_enroll && !enrollmentSettled) {
+          enrollmentWasPending = true;
         }
+        if (next.state === 'paired' && !deviceReported) {
+          deviceReported = true;
+          try {
+            await onDeviceAddedRef.current(next.device_id);
+          } catch {
+            setPairStatusError('The phone paired, but the device list could not refresh. Refresh the console to see it.');
+          }
+        }
+        if (
+          next.state === 'paired' &&
+          next.auto_enroll &&
+          enrollmentWasPending &&
+          enrollmentSettled &&
+          !enrollmentReported
+        ) {
+          enrollmentReported = true;
+          try {
+            await onDeviceAddedRef.current(next.device_id);
+          } catch {
+            setPairStatusError('The phone paired, but the device list could not refresh. Refresh the console to see it.');
+          }
+        }
+        if (
+          (next.state === 'paired' && enrollmentSettled) ||
+          next.state === 'expired' ||
+          next.state === 'cancelled'
+        ) return;
       } catch {
-        /* retry transient status failures */
+        failures += 1;
+        if (failures >= 3) {
+          setPairStatusError('The console cannot confirm this pairing right now. Check the connection or generate a fresh code.');
+        }
       }
-    }, 1500);
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 1500);
+    };
+    void poll();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
-  }, [pairing, pairStatus?.state, token, onDeviceAdded]);
+  }, [pairing?.id, token]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -232,8 +307,8 @@ export function AddDevicePanel({
   const remoteSetup = `mobile-use remote set --url ${systemInfo?.origin || 'https://mobile-use.example.com'} --token <AGENT_TOKEN>\nmobile-use pair`;
 
   return (
-    <Card aria-label="Add a phone or device">
-      <CardHeader className="grid-cols-[minmax(0,1fr)_auto] items-start justify-between gap-4">
+    <Card aria-label="Add a phone or device" className="min-w-0">
+      <CardHeader className="min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start justify-between gap-4">
         <div className="grid gap-1">
           <CardTitle>Add a device</CardTitle>
           <CardDescription>Choose how the phone can reach this workspace.</CardDescription>
@@ -242,22 +317,22 @@ export function AddDevicePanel({
           Close
         </Button>
       </CardHeader>
-      <CardContent className="grid gap-5">
+      <CardContent className="grid min-w-0 gap-5">
         <Tabs value={tab} onValueChange={(value) => setTab(value as AddTab)}>
-          <TabsList className="grid h-auto w-full grid-cols-1 sm:grid-cols-3">
+          <TabsList className="grid h-auto w-full grid-cols-1 min-[420px]:grid-cols-2 min-[620px]:grid-cols-3">
             {canPairCompanion && (
-              <TabsTrigger value="companion">
+              <TabsTrigger value="companion" className="whitespace-normal leading-tight">
                 <Smartphone data-icon="inline-start" />
                 Android companion
               </TabsTrigger>
             )}
             {supportsWifiAdb && (
-              <TabsTrigger value="wifi-adb">
+              <TabsTrigger value="wifi-adb" className="whitespace-normal leading-tight">
                 <Wifi data-icon="inline-start" />
                 Wi-Fi ADB
               </TabsTrigger>
             )}
-            <TabsTrigger value="remote">
+            <TabsTrigger value="remote" className="whitespace-normal leading-tight">
               <Globe2 data-icon="inline-start" />
               Remote / iPhone
             </TabsTrigger>
@@ -270,6 +345,12 @@ export function AddDevicePanel({
                   <AlertDescription>{pairError}</AlertDescription>
                 </Alert>
               )}
+              {pairStatusError && (
+                <Alert variant="destructive" className="mb-4">
+                  <AlertTitle>Pairing status unavailable</AlertTitle>
+                  <AlertDescription>{pairStatusError}</AlertDescription>
+                </Alert>
+              )}
               {pairStatus?.state === 'paired' ? (
                 <Card className="border-primary/30 bg-primary/5">
                   <CardContent className="flex flex-col gap-4 p-6 sm:flex-row sm:items-center">
@@ -279,11 +360,20 @@ export function AddDevicePanel({
                       <p className="text-sm text-muted-foreground">
                         {pairStatus.auto_enrolled
                           ? 'It is enrolled and ready for approved agent sessions.'
-                          : 'Review enrollment and agent access in the device details.'}
+                          : pairStatus.auto_enroll_error
+                            ? 'The phone paired, but agent enrollment needs attention.'
+                            : pairStatus.auto_enroll
+                              ? 'The phone paired. Setting up agent access…'
+                              : 'Review enrollment and agent access in the device details.'}
                       </p>
+                      {pairStatus.auto_enroll_error && (
+                        <p className="text-sm text-destructive">{pairStatus.auto_enroll_error}</p>
+                      )}
                     </div>
-                    <div className="flex gap-2">
-                      <Button onClick={() => void createPairing()}>Pair another</Button>
+                    <div className="flex flex-wrap gap-2">
+                      <Button disabled={pairLoading} onClick={() => void createPairing()}>
+                        {pairLoading ? 'Preparing…' : 'Pair another'}
+                      </Button>
                       <Button variant="outline" onClick={onClose}>
                         Done
                       </Button>
@@ -291,8 +381,8 @@ export function AddDevicePanel({
                   </CardContent>
                 </Card>
               ) : (
-                <div className="grid gap-5 xl:grid-cols-[minmax(280px,360px)_minmax(0,1fr)]">
-                  <Card className="bg-muted/30">
+                <div className="grid min-w-0 gap-5 2xl:grid-cols-[minmax(280px,360px)_minmax(0,1fr)]">
+                  <Card className="min-w-0 bg-muted/30">
                     <CardContent className="grid justify-items-center gap-4 p-5">
                       <div className="grid min-h-56 w-full place-items-center rounded-xl border bg-background p-3">
                         {pairing?.qr_uri ? (
@@ -308,12 +398,12 @@ export function AddDevicePanel({
                           </div>
                         )}
                       </div>
-                      <div className="grid w-full gap-1 text-center">
+                      <div className="grid w-full min-w-0 gap-1 text-center">
                         <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                           Pairing code
                         </span>
                         <div className="flex items-center justify-center gap-2">
-                          <code className="text-2xl font-semibold tracking-[0.18em]">
+                          <code className="max-w-full break-all text-2xl font-semibold tracking-[0.18em]">
                             {pairing?.code || '---- ----'}
                           </code>
                           {pairing?.code && <CopyButton value={pairing.code} />}
@@ -328,7 +418,7 @@ export function AddDevicePanel({
                       </div>
                     </CardContent>
                   </Card>
-                  <div className="grid content-start gap-4">
+                  <div className="grid min-w-0 content-start gap-4">
                     <div className="grid gap-2">
                       <h3 className="font-semibold">Connect in three steps</h3>
                       <ol className="grid gap-2 text-sm text-muted-foreground">
@@ -364,7 +454,7 @@ export function AddDevicePanel({
                           }}
                           disabled={pairLoading}
                         >
-                          <SelectTrigger>
+                          <SelectTrigger className="w-full min-w-0">
                             <SelectValue placeholder="Choose an interface" />
                           </SelectTrigger>
                           <SelectContent>
@@ -383,16 +473,16 @@ export function AddDevicePanel({
                     )}
                     <Card>
                       <CardContent className="grid gap-3 p-4 text-sm">
-                        <div className="flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
                           <span className="text-muted-foreground">Server address</span>
-                          <div className="flex items-center gap-2">
+                          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
                             <code className="break-all text-right">
                               {pairing?.origin || systemInfo?.companion_origin || 'Detecting…'}
                             </code>
                             {pairing?.origin && <CopyButton value={pairing.origin} />}
                           </div>
                         </div>
-                        <div className="flex items-center justify-between gap-3">
+                        <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
                           <span className="text-muted-foreground">Connection</span>
                           <Badge variant="outline">
                             {(pairing?.mode || systemInfo?.companion_mode) === 'lan'
@@ -401,9 +491,9 @@ export function AddDevicePanel({
                           </Badge>
                         </div>
                         {fpShort && (
-                          <div className="flex items-center justify-between gap-3">
+                          <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
                             <span className="text-muted-foreground">TLS fingerprint</span>
-                            <code>{fpShort}</code>
+                            <code className="break-all">{fpShort}</code>
                           </div>
                         )}
                       </CardContent>

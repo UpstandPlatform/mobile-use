@@ -738,14 +738,18 @@ function App() {
               </AlertDialogContent>
             </AlertDialog>
             <Sheet open={showAddDevice} onOpenChange={setShowAddDevice}>
-              <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-3xl">
+              <SheetContent
+                side="right"
+                className="h-dvh w-full max-w-none overflow-y-auto sm:w-[min(48rem,100vw)]"
+                showCloseButton={false}
+              >
                 <SheetHeader className="sr-only">
                   <SheetTitle>Add a device</SheetTitle>
                   <SheetDescription>
                     Choose companion pairing, Wi-Fi ADB, or remote connection.
                   </SheetDescription>
                 </SheetHeader>
-                <div className="pb-6">
+                <div className="min-w-0 pb-6">
                   <AddDevicePanel
                     token={token}
                     actor={actor}

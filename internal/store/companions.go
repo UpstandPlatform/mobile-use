@@ -30,6 +30,10 @@ func (s *Store) PairCompanion(ctx context.Context, actor wire.Actor, id, digest 
 	if !actor.CanManage() && actor.Role != wire.Owner {
 		return wire.ErrForbidden
 	}
+	autoEnrollFlag := 0
+	if autoEnroll {
+		autoEnrollFlag = 1
+	}
 	return s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
 		now := time.Now()
 		if _, err := tx.ExecContext(ctx, s.query("DELETE FROM companion_pairings WHERE workspace = ? AND expires_at <= ? AND state = ?"), actor.Workspace, now.UnixMilli(), "waiting"); err != nil {
@@ -42,7 +46,7 @@ func (s *Store) PairCompanion(ctx context.Context, actor wire.Actor, id, digest 
 		if count >= 5 {
 			return wire.Error("PAIRING_LIMIT", "Wait for an existing pairing code to expire.", 429)
 		}
-		_, err := tx.ExecContext(ctx, s.query("INSERT INTO companion_pairings(digest,id,workspace,owner,creator_role,expires_at,auto_enroll,grant_agents,state) VALUES(?,?,?,?,?,?,?,?,?)"), digest, id, actor.Workspace, actor.Subject, actor.Role, expiry.UnixMilli(), autoEnroll, wire.Marshal(grantAgents), "waiting")
+		_, err := tx.ExecContext(ctx, s.query("INSERT INTO companion_pairings(digest,id,workspace,owner,creator_role,expires_at,auto_enroll,grant_agents,state) VALUES(?,?,?,?,?,?,?,?,?)"), digest, id, actor.Workspace, actor.Subject, actor.Role, expiry.UnixMilli(), autoEnrollFlag, wire.Marshal(grantAgents), "waiting")
 		return err
 	})
 }
@@ -51,7 +55,7 @@ func (s *Store) CompanionPairing(ctx context.Context, actor wire.Actor, id strin
 	var pairing CompanionPairing
 	err := s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
 		var expiresAt int64
-		var autoEnroll, autoEnrolled bool
+		var autoEnroll, autoEnrolled int
 		var agentsJSON string
 		err := tx.QueryRowContext(ctx, s.query("SELECT id,workspace,owner,creator_role,state,device,label,auto_enroll,grant_agents,auto_enrolled,auto_enroll_error,expires_at FROM companion_pairings WHERE workspace = ? AND id = ?"), actor.Workspace, id).Scan(
 			&pairing.ID, &pairing.Workspace, &pairing.Owner, &pairing.CreatorRole, &pairing.State, &pairing.DeviceID,
@@ -69,8 +73,8 @@ func (s *Store) CompanionPairing(ctx context.Context, actor wire.Actor, id strin
 		if err := json.Unmarshal([]byte(agentsJSON), &pairing.GrantAgents); err != nil {
 			return err
 		}
-		pairing.AutoEnroll = autoEnroll
-		pairing.AutoEnrolled = autoEnrolled
+		pairing.AutoEnroll = autoEnroll != 0
+		pairing.AutoEnrolled = autoEnrolled != 0
 		pairing.ExpiresAt = time.UnixMilli(expiresAt)
 		if pairing.State == "waiting" && !now.Before(pairing.ExpiresAt) {
 			pairing.State = "expired"
@@ -110,6 +114,10 @@ func (s *Store) CancelCompanionPairing(ctx context.Context, actor wire.Actor, id
 }
 
 func (s *Store) MarkCompanionAutoEnroll(ctx context.Context, actor wire.Actor, id string, enrolled bool, failure string) error {
+	enrolledFlag := 0
+	if enrolled {
+		enrolledFlag = 1
+	}
 	if len(failure) > 500 {
 		failure = failure[:500]
 	}
@@ -125,7 +133,7 @@ func (s *Store) MarkCompanionAutoEnroll(ctx context.Context, actor wire.Actor, i
 		if !actor.CanManage() && (actor.Role != wire.Owner || actor.Subject != owner) {
 			return wire.ErrNotFound
 		}
-		_, err = tx.ExecContext(ctx, s.query("UPDATE companion_pairings SET auto_enrolled = ?, auto_enroll_error = ? WHERE workspace = ? AND id = ? AND state = ?"), enrolled, strings.TrimSpace(failure), actor.Workspace, id, "paired")
+		_, err = tx.ExecContext(ctx, s.query("UPDATE companion_pairings SET auto_enrolled = ?, auto_enroll_error = ? WHERE workspace = ? AND id = ? AND state = ?"), enrolledFlag, strings.TrimSpace(failure), actor.Workspace, id, "paired")
 		return err
 	})
 }
@@ -134,7 +142,7 @@ func (s *Store) EnrollCompanion(ctx context.Context, digest, token, label string
 	companion := Companion{ID: wire.NewID(), Label: label}
 	err := s.systemScope(ctx, func(tx *sql.Tx) error {
 		var expiresAt int64
-		var autoEnroll bool
+		var autoEnroll int
 		var agentsJSON string
 		err := tx.QueryRowContext(ctx, s.lock("SELECT id,workspace,owner,creator_role,expires_at,auto_enroll,grant_agents FROM companion_pairings WHERE digest = ? AND state = ? AND expires_at > ?"), digest, "waiting", now.UnixMilli()).Scan(
 			&companion.Pairing.ID, &companion.Workspace, &companion.Owner, &companion.Pairing.CreatorRole, &expiresAt, &autoEnroll, &agentsJSON,
@@ -150,7 +158,7 @@ func (s *Store) EnrollCompanion(ctx context.Context, digest, token, label string
 		}
 		companion.Pairing.Workspace = companion.Workspace
 		companion.Pairing.Owner = companion.Owner
-		companion.Pairing.AutoEnroll = autoEnroll
+		companion.Pairing.AutoEnroll = autoEnroll != 0
 		companion.Pairing.ExpiresAt = time.UnixMilli(expiresAt)
 
 		result, err := tx.ExecContext(ctx, s.query("UPDATE companion_pairings SET state = ?, device = ?, label = ? WHERE digest = ? AND state = ?"), "paired", companion.ID, label, digest, "waiting")

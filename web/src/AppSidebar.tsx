@@ -33,12 +33,14 @@ export function AppSidebar({
   page,
   setPage,
   actor,
+  version,
   sessionsCount,
   onSignOut,
 }: {
   page: ConsolePage;
   setPage: (page: ConsolePage) => void;
   actor: Actor;
+  version?: string;
   sessionsCount: number;
   onSignOut: () => void;
 }) {
@@ -129,6 +131,11 @@ export function AppSidebar({
       </SidebarContent>
 
       <SidebarFooter className="gap-2 p-3">
+        {version && (
+          <div className="px-3 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+            mobile-use <span className="font-medium text-foreground">{version}</span>
+          </div>
+        )}
         <div className="grid gap-1 rounded-lg bg-muted p-3 group-data-[collapsible=icon]:hidden">
           <span className="truncate text-sm font-medium">{actor.subject}</span>
           <span className="truncate text-xs text-muted-foreground">{actor.role}</span>

@@ -114,9 +114,11 @@ function App() {
   const [auditReload, setAuditReload] = useState(0);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<Date>();
   const [captureRevision, setCaptureRevision] = useState(0);
   const [showAddDevice, setShowAddDevice] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<Device>();
+  const refreshSequence = useRef(0);
 
   const signedIn = useCallback((value: string) => {
     sessionStorage.setItem('mobile-use.token', value);
@@ -153,12 +155,14 @@ function App() {
 
   const refresh = useCallback(
     async (credential: string) => {
+      const sequence = ++refreshSequence.current;
       setInventoryState((current) => current === 'ready' ? current : 'loading');
       try {
         const [nextDevices, nextSessions] = await Promise.all([
           api<Device[]>(credential, '/v1/devices'),
           api<Session[]>(credential, '/v1/sessions'),
         ]);
+        if (sequence !== refreshSequence.current) return;
         setDevices(nextDevices);
         setSessions(nextSessions);
         setSelected((current) =>
@@ -166,6 +170,7 @@ function App() {
         );
         setInventoryState('ready');
       } catch (error) {
+        if (sequence !== refreshSequence.current) return;
         setInventoryState((current) => current === 'ready' ? 'ready' : 'error');
         throw error;
       }
@@ -300,8 +305,9 @@ function App() {
         try {
           await refresh(token);
         } catch {
-          setError('The action completed, but the workspace could not refresh. Try Refresh again.');
-          toast.error('The action completed, but the workspace could not refresh.');
+          const message = 'The action completed, but the workspace could not refresh. Try Refresh again.';
+          setError(message);
+          toast.error(message);
         }
       }
       return result;
@@ -309,6 +315,22 @@ function App() {
       setError(errorText(error));
       toast.error(errorText(error));
       return undefined;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshWorkspace() {
+    setBusy(true);
+    setError('');
+    try {
+      await refresh(token);
+      setLastRefreshedAt(new Date());
+      if (tab === 'Audit') setAuditReload((value) => value + 1);
+    } catch (reason) {
+      const message = errorText(reason);
+      setError(message);
+      toast.error(message);
     } finally {
       setBusy(false);
     }
@@ -490,6 +512,7 @@ function App() {
             page={tab}
             setPage={setPage}
             actor={actor}
+            version={systemInfo?.version}
             sessionsCount={pendingCount}
             onSignOut={signOut}
           />
@@ -505,6 +528,11 @@ function App() {
                 </BreadcrumbList>
               </Breadcrumb>
               <div className="ml-auto flex items-center gap-2">
+                {lastRefreshedAt && (
+                  <span className="hidden text-xs text-muted-foreground md:inline" aria-live="polite">
+                    Updated {lastRefreshedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+                  </span>
+                )}
                 <Badge variant="outline" className="hidden sm:inline-flex">
                   {actor.workspace === 'local' ? 'Local' : actor.workspace}
                 </Badge>
@@ -513,10 +541,7 @@ function App() {
                   variant="outline"
                   size="sm"
                   disabled={busy}
-                  onClick={() => {
-                    void run(() => refresh(token), 'Workspace refreshed.');
-                    if (tab === 'Audit') setAuditReload((value) => value + 1);
-                  }}
+                  onClick={() => void refreshWorkspace()}
                 >
                   <RefreshCw data-icon="inline-start" className={busy ? 'animate-spin' : ''} />
                   Refresh
@@ -725,12 +750,27 @@ function App() {
                             )}
                           {pending && (
                             <Alert>
-                              <Activity />
-                              <AlertTitle>Access request is waiting for approval</AlertTitle>
+                              <Check />
+                              <AlertTitle>Access request sent · waiting for approval</AlertTitle>
                               <AlertDescription>
-                                {device.online
-                                  ? 'The request is waiting on the phone. After approval, the owner must start screen sharing and accept Android’s capture prompt before frames appear here.'
-                                  : 'The request is still pending on the server. The phone can receive it when it reconnects; screen capture starts only after the owner approves and accepts Android’s capture prompt.'}
+                                {device.mode === 'companion'
+                                  ? device.online
+                                    ? 'The request is waiting on the phone. After approval, start screen sharing in the companion and accept Android’s capture prompt before frames appear here.'
+                                    : 'The request is saved on the server and will reach the phone when the companion reconnects.'
+                                  : 'The request is waiting for owner approval. After approval, the workstation connector can capture the device screen.'}
+                                <div className="mt-2 grid gap-1 text-xs">
+                                  <span>
+                                    <span className="font-medium">Purpose:</span> {pending.purpose}
+                                  </span>
+                                  <span>
+                                    <span className="font-medium">Requested:</span>{' '}
+                                    {pending.capabilities.map((capability) => labels[capability] || capability).join(', ')}
+                                  </span>
+                                  <span>
+                                    <span className="font-medium">Request ID:</span>{' '}
+                                    <code className="break-all">{pending.id}</code>
+                                  </span>
+                                </div>
                               </AlertDescription>
                             </Alert>
                           )}
@@ -751,10 +791,7 @@ function App() {
                               device={device}
                               busy={busy}
                               submit={(body) =>
-                                run(
-                                  () => api<Session>(token, '/v1/sessions', 'POST', body),
-                                  'Request sent. Review and approve it in the companion app.',
-                                )
+                                run(() => api<Session>(token, '/v1/sessions', 'POST', body))
                               }
                             />
                           )}
@@ -1465,7 +1502,9 @@ function EnrollmentForm({
             {agentError && <FieldError>{agentError}</FieldError>}
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button disabled={busy || Boolean(nameError) || Boolean(ownerError)}>{busy ? 'Saving…' : device.enabled ? 'Save access' : 'Enroll device'}</Button>
+            <Button type="submit" disabled={busy || Boolean(nameError) || Boolean(ownerError)}>
+              {busy ? 'Saving…' : device.enabled ? 'Save access' : 'Enroll device'}
+            </Button>
             {device.enabled && (
               <Button
                 type="button"
@@ -1540,6 +1579,8 @@ function StartForm({
 }) {
   const [purpose, setPurpose] = useState('');
   const [attempted, setAttempted] = useState(false);
+  const [submitted, setSubmitted] = useState<Session>();
+  const submitInFlight = useRef(false);
   const purposeValue = purpose.trim();
   const purposeError = purposeValue.length < 3
     ? 'Enter a purpose with at least 3 non-space characters.'
@@ -1555,7 +1596,7 @@ function StartForm({
       <CardHeader>
         <CardTitle className="text-base">Request a device session</CardTitle>
         <CardDescription>
-          The phone owner reviews this request. Screen capture also needs to be started and approved on the phone.
+          The phone owner reviews this request. The Android companion also needs screen sharing started and its capture prompt approved on the phone.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1565,10 +1606,25 @@ function StartForm({
           onSubmit={async (event) => {
             event.preventDefault();
             setAttempted(true);
-            if (purposeError || selected.length === 0 || busy) return;
-            await submit({ device_id: device.id, purpose: purposeValue, capabilities: selected });
+            if (purposeError || selected.length === 0 || busy || submitInFlight.current) return;
+            submitInFlight.current = true;
+            try {
+              const created = await submit({ device_id: device.id, purpose: purposeValue, capabilities: selected });
+              if (created?.state === 'pending_approval') setSubmitted(created);
+            } finally {
+              submitInFlight.current = false;
+            }
           }}
         >
+          {submitted && (
+            <Alert>
+              <Check />
+              <AlertTitle>Request created and sent to the phone</AlertTitle>
+              <AlertDescription>
+                Waiting for owner approval. Request ID: <code className="break-all">{submitted.id}</code>
+              </AlertDescription>
+            </Alert>
+          )}
           <Field data-invalid={attempted && Boolean(purposeError)}>
             <FieldLabel htmlFor="session-purpose">Purpose</FieldLabel>
             <Textarea
@@ -1617,7 +1673,7 @@ function StartForm({
             )}
           </fieldset>
           <div>
-            <Button disabled={busy || options.length === 0}>
+            <Button type="submit" disabled={busy || options.length === 0}>
               {busy ? 'Sending request…' : 'Request access'}
               {!busy && <ArrowRight data-icon="inline-end" />}
             </Button>
@@ -1762,6 +1818,7 @@ function MaintenanceForm({
           </Field>
           <div>
             <Button
+              type="submit"
               variant={verb === 'reset' ? 'destructive' : 'default'}
               disabled={busy || confirm !== phrase}
             >
@@ -2544,7 +2601,7 @@ function Viewer({
                   value={text}
                   onChange={(event) => setText(event.target.value)}
                 />
-                <Button disabled={busy || !text}>Send text</Button>
+                <Button type="submit" disabled={busy || !text}>Send text</Button>
               </form>
             )}
           </div>

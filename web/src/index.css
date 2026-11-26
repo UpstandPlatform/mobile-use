@@ -120,6 +120,8 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+    scrollbar-color: color-mix(in oklch, var(--muted-foreground) 62%, var(--background)) transparent;
+    scrollbar-width: thin;
   }
   html {
     @apply min-w-80 font-sans;
@@ -133,6 +135,27 @@
   textarea {
     @apply focus-visible:outline-none;
   }
+}
+
+*::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--muted-foreground), var(--background) 48%);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+  background-clip: padding-box;
 }
 
 @layer components {

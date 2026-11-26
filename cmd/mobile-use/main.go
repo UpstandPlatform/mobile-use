@@ -39,6 +39,8 @@ func run(ctx context.Context, args []string) error {
 	case "version":
 		fmt.Println(version)
 		return nil
+	case "upgrade":
+		return cmdUpgrade(ctx, args[1:])
 	case "up":
 		return serve(ctx, args[1:], true)
 	case "serve":
@@ -115,6 +117,7 @@ Administration:
   mobile-use init                       Create local owner and agent credentials
   mobile-use serve [--help]             Run the local daemon or self-hosted server
   mobile-use connector --help           Run a remote mTLS device connector
+  mobile-use upgrade                    Download and install the latest GitHub release
   mobile-use token admin|agent          Print a local credential
   mobile-use doctor                     Check ADB, Wi-Fi pairing, and daemon readiness
   mobile-use call METHOD /v1/path [IN]  Call the HTTP API directly

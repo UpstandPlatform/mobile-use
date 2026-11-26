@@ -12,3 +12,4 @@
 *.key
 *.p12
 .env
+.vercel/

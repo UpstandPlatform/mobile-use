@@ -66,6 +66,21 @@ jobs:
       - run: npm --prefix web ci
       - run: npm --prefix web run build
       - run: node web/node_modules/typescript/bin/tsc --noEmit --strict --target es2022 --lib es2022,dom sdk/typescript/index.ts
+  landing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: landing/mobile-use-landing/package-lock.json
+      - run: npm ci --prefix landing/mobile-use-landing
+      - run: npm run lint --prefix landing/mobile-use-landing
+      - run: npm run typecheck --prefix landing/mobile-use-landing
+      - run: npm run build --prefix landing/mobile-use-landing
   android:
     runs-on: ubuntu-latest
     steps:

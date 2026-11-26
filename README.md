@@ -4,6 +4,8 @@ Control enrolled Android phones and iPhones from an agent or operator console. R
 
 [Downloads](https://github.com/UpstandPlatform/mobile-use/releases) · [Deployment guide](docs/operations.md) · [Verification status](docs/verification.md)
 
+The standalone product introduction site is in [landing/mobile-use-landing](landing/mobile-use-landing/README.md). Import the repository into Vercel with the repository root (`.`) as the project root. The root [vercel.json](vercel.json) routes all public paths to the `landing` Next.js service; the device server, embedded console, and SDKs stay outside this Vercel deployment.
+
 ```mermaid
 flowchart LR
     Agent[MCP agent] -->|sessions and actions| Service[mobile-use service]
@@ -34,6 +36,8 @@ Extract the archive. From its folder, run `up` to initialize local credentials, 
 ```sh
 ./mobile-use up
 ```
+
+Starting with v0.2.5, update the installed CLI to the latest stable GitHub release with `mobile-use upgrade`. The public release can be checked and downloaded directly from GitHub without another account or tool. Use `mobile-use upgrade --check` to check without installing. Windows stages a checksum-verified update and replaces the executable after running `mobile-use` processes release it.
 
 Or run each step manually:
 

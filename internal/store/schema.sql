@@ -78,3 +78,7 @@ CREATE TABLE IF NOT EXISTS companions (
     owner TEXT NOT NULL,
     label TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS mobile_use_schema_migrations (
+    version INTEGER PRIMARY KEY
+);

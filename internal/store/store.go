@@ -21,6 +21,7 @@ import (
 var schema string
 
 const (
+	schemaVersion  = 1
 	ConnectorTTL   = 10 * time.Second
 	PresenceTTL    = 15 * time.Second
 	IdleTimeout    = 5 * time.Minute
@@ -75,6 +76,13 @@ func (s *Store) migrate(ctx context.Context) error {
 				return err
 			}
 		}
+		current, err := s.currentSchemaVersion(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if current >= schemaVersion {
+			return nil
+		}
 		for _, statement := range strings.Split(schema, ";") {
 			if strings.TrimSpace(statement) == "" {
 				continue
@@ -87,10 +95,30 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 		if s.postgres {
-			return activateRLS(ctx, tx)
+			if err := activateRLS(ctx, tx); err != nil {
+				return err
+			}
 		}
-		return nil
+		_, err = tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), schemaVersion)
+		return err
 	})
+}
+
+func (s *Store) currentSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
+	var exists bool
+	if s.postgres {
+		if err := tx.QueryRowContext(ctx, "SELECT to_regclass(current_schema() || '.mobile_use_schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
+			return 0, err
+		}
+	} else if err := tx.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='mobile_use_schema_migrations')").Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
+	var version int
+	err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM mobile_use_schema_migrations").Scan(&version)
+	return version, err
 }
 
 func (s *Store) ensureDeviceRemovedColumn(ctx context.Context, tx *sql.Tx) error {

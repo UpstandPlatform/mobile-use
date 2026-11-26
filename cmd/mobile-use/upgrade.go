@@ -146,7 +146,7 @@ func cmdUpgrade(ctx context.Context, args []string) error {
 		return fmt.Errorf("install %s: %w", release.TagName, err)
 	}
 	if pending {
-		fmt.Printf("Upgrade to %s is staged. Windows will replace the executable after this command exits and any other mobile-use processes stop. Run `mobile-use version` to confirm.\n", release.TagName)
+		fmt.Printf("Upgrade to %s is staged. Windows will replace the on-disk executable after this command exits; already-running processes keep their loaded version until restarted. Run `mobile-use version` to confirm.\n", release.TagName)
 		return nil
 	}
 	fmt.Printf("Upgraded mobile-use to %s\n", release.TagName)

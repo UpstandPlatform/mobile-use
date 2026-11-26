@@ -345,8 +345,12 @@ func (w *worker) observe(ctx context.Context, driver Driver, request wire.Observ
 		if err != nil {
 			obs.Partial = append(obs.Partial, "UI hierarchy unavailable")
 		}
-		for _, node := range obs.Nodes {
-			if node.Enabled && node.Bounds.Width > 0 && node.Bounds.Height > 0 {
+		for index := range obs.Nodes {
+			node := &obs.Nodes[index]
+			if !node.VisibilityKnown {
+				node.Visible = true
+			}
+			if node.Enabled && node.IsVisible() && node.Bounds.Width > 0 && node.Bounds.Height > 0 {
 				nodes[node.ID] = node.Bounds
 			}
 		}
@@ -442,7 +446,7 @@ func (w *worker) action(ctx context.Context, driver Driver, action wire.Action) 
 			return wire.ErrStale
 		}
 		for _, node := range nodes {
-			if node.ID == action.NodeID && node.Bounds == rect && node.Enabled {
+			if node.ID == action.NodeID && node.Bounds == rect && node.Enabled && node.IsVisible() {
 				bounds = &rect
 				break
 			}
@@ -460,6 +464,37 @@ func (w *worker) action(ctx context.Context, driver Driver, action wire.Action) 
 
 func Pixel(point wire.Point, display Display) (int, int) {
 	return int(point.X * float64(display.Width)), int(point.Y * float64(display.Height))
+}
+
+func nodeScrollPath(rect wire.Rect, display Display, direction string) (wire.TouchPath, error) {
+	if display.Width < 1 || display.Height < 1 || rect.Width < 1 || rect.Height < 1 {
+		return wire.TouchPath{}, wire.ErrStale
+	}
+	x := rect.X + rect.Width/2
+	y := rect.Y + rect.Height/2
+	x2, y2 := x, y
+	switch direction {
+	case "up":
+		y2 -= max(1, rect.Height/3)
+	case "down":
+		y2 += max(1, rect.Height/3)
+	case "left":
+		x2 -= max(1, rect.Width/3)
+	case "right":
+		x2 += max(1, rect.Width/3)
+	default:
+		return wire.TouchPath{}, wire.ErrUnsupported
+	}
+	minX, minY := rect.X, rect.Y
+	maxX, maxY := rect.X+rect.Width-1, rect.Y+rect.Height-1
+	x2, y2 = min(max(x2, minX), maxX), min(max(y2, minY), maxY)
+	if x < 0 || x >= display.Width || y < 0 || y >= display.Height || x2 < 0 || x2 >= display.Width || y2 < 0 || y2 >= display.Height {
+		return wire.TouchPath{}, wire.ErrStale
+	}
+	return wire.TouchPath{
+		Start: wire.Point{X: float64(x) / float64(display.Width), Y: float64(y) / float64(display.Height)},
+		End:   wire.Point{X: float64(x2) / float64(display.Width), Y: float64(y2) / float64(display.Height)},
+	}, nil
 }
 
 func ImageDimensions(data []byte) (int, int, error) {

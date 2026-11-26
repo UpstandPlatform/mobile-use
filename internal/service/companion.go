@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"mobile-use/internal/connector"
 	"mobile-use/internal/store"
 	"mobile-use/internal/wire"
@@ -497,6 +498,7 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 		respond(w, 200, session, err)
 	}))
 	router.HandleFunc("POST /companion/sessions/{id}/frame", c.phone(c.uploadFrame))
+	router.HandleFunc("GET /companion/sessions/{id}/frames", c.phone(c.streamPhoneFrames))
 	router.HandleFunc("POST /companion/sensors/{id}/deny", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
 		entry, err := c.sensorFor(phone, r.PathValue("id"))
 		if err != nil {
@@ -588,7 +590,7 @@ func (c *Companion) streamFrames(w http.ResponseWriter, r *http.Request, actor w
 	} else {
 		writeFrameEvent(w, flusher, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
 	}
-	keepalive := time.NewTicker(15 * time.Second)
+	keepalive := time.NewTicker(5 * time.Second)
 	defer keepalive.Stop()
 	for {
 		select {
@@ -712,39 +714,115 @@ func (c *Companion) phoneSession(ctx context.Context, phone store.Companion, id 
 }
 
 func (c *Companion) uploadFrame(w http.ResponseWriter, r *http.Request, phone store.Companion) {
-	ctx := r.Context()
-	now := time.Now()
-	session, err := c.phoneSession(ctx, phone, r.PathValue("id"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if !containsCap(session.Capabilities, wire.Screen) {
-		writeError(w, wire.ErrForbidden)
-		return
-	}
-	target := store.Target{Workspace: phone.Workspace, Connector: phoneConnector(phone.ID), Device: phone.ID, Session: session.ID, Generation: session.Generation}
-	if err := c.Store.Confirm(ctx, target, now); err != nil {
-		writeError(w, err)
-		return
-	}
-	c.mu.Lock()
-	previous := c.frames[phone.ID]
-	c.mu.Unlock()
-	if previous.session == session.ID && now.Sub(previous.observation.CapturedAt) < 200*time.Millisecond {
-		writeError(w, wire.Error("FRAME_RATE_LIMIT", "Send at most five frames per second.", 429))
-		return
-	}
 	defer r.Body.Close()
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 650<<10))
 	if err != nil || http.DetectContentType(data) != "image/jpeg" {
 		writeError(w, wire.Error("INVALID_FRAME", "Send a JPEG frame of up to 650 KiB.", 400))
 		return
 	}
+	_, err = c.acceptFrame(r.Context(), phone, r.PathValue("id"), data, time.Now())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type phoneFrameAck struct {
+	Type       string     `json:"type"`
+	FrameID    string     `json:"frame_id,omitempty"`
+	CapturedAt *time.Time `json:"captured_at,omitempty"`
+	Code       string     `json:"code,omitempty"`
+	Message    string     `json:"message,omitempty"`
+}
+
+func (c *Companion) streamPhoneFrames(w http.ResponseWriter, r *http.Request, phone store.Companion) {
+	session, err := c.frameSession(r.Context(), phone, r.PathValue("id"), time.Now())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	upgrader := websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.SetReadLimit(650 << 10)
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetPingHandler(func(data string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(5*time.Second))
+	})
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(30 * time.Second)) })
+	for {
+		kind, data, readErr := conn.ReadMessage()
+		if readErr != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if kind != websocket.BinaryMessage || http.DetectContentType(data) != "image/jpeg" {
+			if !writePhoneFrameAck(conn, phoneFrameAck{Type: "error", Code: "INVALID_FRAME", Message: "Send a JPEG frame as a binary message."}) {
+				return
+			}
+			continue
+		}
+		frame, frameErr := c.acceptFrame(r.Context(), phone, session.ID, data, time.Now())
+		if frameErr != nil {
+			fault := wire.Public(frameErr)
+			if fault.Status == http.StatusTooManyRequests {
+				if !writePhoneFrameAck(conn, phoneFrameAck{Type: "dropped", Code: fault.Code}) {
+					return
+				}
+				continue
+			}
+			writePhoneFrameAck(conn, phoneFrameAck{Type: "error", Code: fault.Code, Message: fault.Message})
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, fault.Code), time.Now().Add(time.Second))
+			return
+		}
+		if !writePhoneFrameAck(conn, phoneFrameAck{Type: "frame", FrameID: frame.FrameID, CapturedAt: &frame.CapturedAt}) {
+			return
+		}
+	}
+}
+
+func writePhoneFrameAck(conn *websocket.Conn, ack phoneFrameAck) bool {
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return conn.WriteJSON(ack) == nil
+}
+
+func (c *Companion) frameSession(ctx context.Context, phone store.Companion, id string, now time.Time) (wire.Session, error) {
+	session, err := c.phoneSession(ctx, phone, id)
+	if err != nil {
+		return session, err
+	}
+	if !containsCap(session.Capabilities, wire.Screen) {
+		return session, wire.ErrForbidden
+	}
+	target := store.Target{Workspace: phone.Workspace, Connector: phoneConnector(phone.ID), Device: phone.ID, Session: session.ID, Generation: session.Generation}
+	if err := c.Store.Confirm(ctx, target, now); err != nil {
+		return session, err
+	}
+	return session, nil
+}
+
+func (c *Companion) acceptFrame(ctx context.Context, phone store.Companion, id string, data []byte, now time.Time) (wire.Observation, error) {
+	session, err := c.frameSession(ctx, phone, id, now)
+	if err != nil {
+		return wire.Observation{}, err
+	}
+	c.mu.Lock()
+	previous := c.frames[phone.ID]
+	c.mu.Unlock()
+	if previous.session == session.ID && now.Sub(previous.observation.CapturedAt) < 100*time.Millisecond {
+		return wire.Observation{}, wire.Error("FRAME_RATE_LIMIT", "The live screen is limited to ten frames per second.", 429)
+	}
+	if len(data) == 0 || len(data) > 650<<10 || http.DetectContentType(data) != "image/jpeg" {
+		return wire.Observation{}, wire.Error("INVALID_FRAME", "Send a JPEG frame of up to 650 KiB.", 400)
+	}
 	width, height, err := connector.ImageDimensions(data)
 	if err != nil || width > 1920 || height > 1920 {
-		writeError(w, wire.Error("INVALID_FRAME", "The display frame dimensions are unsupported.", 400))
-		return
+		return wire.Observation{}, wire.Error("INVALID_FRAME", "The display frame dimensions are unsupported.", 400)
 	}
 	orientation := "portrait"
 	if width > height {
@@ -755,13 +833,12 @@ func (c *Companion) uploadFrame(w http.ResponseWriter, r *http.Request, phone st
 	c.sweepLocked(now)
 	if len(c.frames) >= 100 && c.frames[phone.ID].session == "" {
 		c.mu.Unlock()
-		writeError(w, wire.Error("MEDIA_LIMIT", "The server is at its screen-sharing capacity.", 429))
-		return
+		return wire.Observation{}, wire.Error("MEDIA_LIMIT", "The server is at its screen-sharing capacity.", 429)
 	}
 	c.frames[phone.ID] = phoneFrame{frame, session.ID, session.Generation}
 	c.publishFrameLocked(phone.ID, c.frames[phone.ID])
 	c.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
+	return frame, nil
 }
 
 func containsCap(caps []wire.Capability, expected wire.Capability) bool {

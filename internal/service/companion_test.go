@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"mobile-use/internal/service"
 	"mobile-use/internal/store"
 	"mobile-use/internal/wire"
@@ -214,6 +215,142 @@ func TestCompanionFrameStreamPushesFramesWithoutPollingOperations(t *testing.T) 
 	second := readSSEBlock(t, reader)
 	if !strings.Contains(second, "event: frame") || !strings.Contains(second, `"frame_id"`) {
 		t.Fatalf("stream did not push a subsequent frame: %q", second)
+	}
+}
+
+func TestCompanionFrameWebSocketAcksFramesAndFeedsConsole(t *testing.T) {
+	f := setup(t)
+	code := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", nil)["code"].(string)
+	var enrolled map[string]string
+	opening := []byte(wire.Marshal(map[string]string{"code": code, "label": "Streamed phone"}))
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, 201), &enrolled); err != nil {
+		t.Fatal(err)
+	}
+	token, deviceID := enrolled["token"], enrolled["device_id"]
+	phonePost(t, f.origin, token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), 200)
+	enroll(t, f, deviceID, wire.Personal, []wire.Capability{wire.Screen})
+	session := request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{
+		DeviceID: deviceID, Purpose: "Verify acknowledged frame streaming", Capabilities: []wire.Capability{wire.Screen},
+	})
+	phonePost(t, f.origin, token, "/companion/sessions/"+session.ID+"/approve", "application/json", []byte(`{}`), 200)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	streamRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, f.origin+"/v1/companion/sessions/"+session.ID+"/frames", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamRequest.Header.Set("Authorization", "Bearer "+tokenAgent)
+	response, err := http.DefaultClient.Do(streamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	sse := bufio.NewReader(response.Body)
+	if waiting := readSSEBlock(t, sse); !strings.Contains(waiting, `"state":"waiting"`) {
+		t.Fatalf("expected initial waiting event, got %q", waiting)
+	}
+
+	socketURL := strings.Replace(f.origin, "http://", "ws://", 1) + "/companion/sessions/" + session.ID + "/frames"
+	headers := http.Header{"Authorization": []string{"Bearer " + token}}
+	socket, _, err := websocket.DefaultDialer.DialContext(ctx, socketURL, headers)
+	if err != nil {
+		t.Fatalf("open phone frame stream: %v", err)
+	}
+	defer socket.Close()
+	var picture bytes.Buffer
+	if err := jpeg.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 80, 120)), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := socket.WriteMessage(websocket.BinaryMessage, picture.Bytes()); err != nil {
+		t.Fatalf("send first captured frame: %v", err)
+	}
+	_, ackBytes, err := socket.ReadMessage()
+	if err != nil {
+		t.Fatalf("read first frame acknowledgement: %v", err)
+	}
+	var ack struct {
+		Type    string `json:"type"`
+		FrameID string `json:"frame_id"`
+	}
+	if err := json.Unmarshal(ackBytes, &ack); err != nil || ack.Type != "frame" || ack.FrameID == "" {
+		t.Fatalf("invalid first frame acknowledgement: %s (%v)", ackBytes, err)
+	}
+	consoleFrame := readSSEBlock(t, sse)
+	if !strings.Contains(consoleFrame, `"frame_id":"`+ack.FrameID+`"`) {
+		t.Fatalf("console received a different frame than the phone was acknowledged: %q", consoleFrame)
+	}
+
+	observed := request[wire.Result](t, f.agent, "POST", "/v1/sessions/"+session.ID+"/operations", wire.Operation{
+		Kind: "observe", Observe: &wire.ObserveRequest{Screen: true},
+	})
+	if observed.Observation == nil || observed.Observation.FrameID != ack.FrameID || observed.Observation.Width != 80 || observed.Observation.Height != 120 {
+		t.Fatalf("agent did not observe the acknowledged captured frame: %+v", observed.Observation)
+	}
+
+	time.Sleep(205 * time.Millisecond)
+	if err := socket.WriteMessage(websocket.BinaryMessage, picture.Bytes()); err != nil {
+		t.Fatalf("send subsequent frame: %v", err)
+	}
+	_, nextBytes, err := socket.ReadMessage()
+	if err != nil {
+		t.Fatalf("read subsequent frame acknowledgement: %v", err)
+	}
+	var next struct {
+		Type    string `json:"type"`
+		FrameID string `json:"frame_id"`
+	}
+	if err := json.Unmarshal(nextBytes, &next); err != nil || next.Type != "frame" || next.FrameID == ack.FrameID {
+		t.Fatalf("subsequent frame was not independently accepted: %s (%v)", nextBytes, err)
+	}
+}
+
+func TestDeleteDeviceEndsSessionRevokesCompanionAndHidesInventory(t *testing.T) {
+	f := setup(t)
+	code := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", nil)["code"].(string)
+	var enrolled map[string]string
+	opening := []byte(wire.Marshal(map[string]string{"code": code, "label": "Removable phone"}))
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, 201), &enrolled); err != nil {
+		t.Fatal(err)
+	}
+	token, deviceID := enrolled["token"], enrolled["device_id"]
+	phonePost(t, f.origin, token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), 200)
+	enroll(t, f, deviceID, wire.Personal, []wire.Capability{wire.Screen})
+	session := request[wire.Session](t, f.agent, "POST", "/v1/sessions", wire.StartSession{
+		DeviceID: deviceID, Purpose: "Remove a phone from inventory", Capabilities: []wire.Capability{wire.Screen},
+	})
+	phonePost(t, f.origin, token, "/companion/sessions/"+session.ID+"/approve", "application/json", []byte(`{}`), 200)
+
+	request[map[string]bool](t, f.owner, http.MethodDelete, "/v1/devices/"+deviceID, nil)
+	devices := request[[]wire.Device](t, f.owner, http.MethodGet, "/v1/devices", nil)
+	for _, device := range devices {
+		if device.ID == deviceID {
+			t.Fatal("removed phone is still present in the inventory")
+		}
+	}
+	ended := request[wire.Session](t, f.owner, http.MethodGet, "/v1/sessions/"+session.ID, nil)
+	if ended.State != wire.Ended || ended.Reason != "device_removed" {
+		t.Fatalf("active session was not ended while preserving its history: %+v", ended)
+	}
+	phonePost(t, f.origin, token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), 403)
+
+	actor := request[wire.Actor](t, f.owner, http.MethodGet, "/v1/me", nil)
+	if err := f.db.Register(t.Context(), actor.Workspace, "companion."+deviceID, []wire.Inventory{{
+		ID: deviceID, Label: "Removable phone", Platform: "android", Mode: "companion",
+		Capabilities: wire.Capabilities{wire.Screen: true},
+	}}, time.Now()); err != nil {
+		t.Fatalf("source rediscovery after removal: %v", err)
+	}
+	devices = request[[]wire.Device](t, f.owner, http.MethodGet, "/v1/devices", nil)
+	for _, device := range devices {
+		if device.ID == deviceID {
+			t.Fatal("removed phone reappeared when its connector reported it again")
+		}
+	}
+	if err := f.owner.Request(t.Context(), http.MethodPut, "/v1/devices/"+deviceID, wire.Enrollment{
+		Owner: "owner", Profile: wire.Personal,
+	}, nil); wire.Public(err).Status != http.StatusNotFound {
+		t.Fatalf("removed phone enrollment returned %v, want 404", err)
 	}
 }
 

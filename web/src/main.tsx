@@ -12,6 +12,7 @@ import {
   ShieldCheck,
   Smartphone,
   Sun,
+  Trash2,
 } from 'lucide-react';
 import { ThemeProvider, useTheme } from 'next-themes';
 import { api, beginLogin, completeLogin, exchangeLaunchTicket, labels } from './api';
@@ -69,6 +70,9 @@ import { Toaster } from '@/components/ui/sonner';
 import './index.css';
 
 type Tab = ConsolePage;
+type ScreenPointer = { start: { x: number; y: number }; end: { x: number; y: number }; released: boolean };
+type TouchMode = 'direct' | 'tap' | 'double_tap' | 'long_press' | 'swipe' | 'drag' | 'scroll' | 'fling';
+type AndroidKey = 'enter' | 'tab' | 'escape' | 'menu' | 'dpad_up' | 'dpad_down' | 'dpad_left' | 'dpad_right' | 'volume_up' | 'volume_down' | 'volume_mute';
 const time = (date: string) => new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const errorText = (error: unknown) => (error instanceof Error ? error.message : 'Something went wrong.');
 
@@ -87,6 +91,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [captureRevision, setCaptureRevision] = useState(0);
   const [showAddDevice, setShowAddDevice] = useState(false);
+  const [removeTarget, setRemoveTarget] = useState<Device>();
 
   const signedIn = useCallback((value: string) => {
     sessionStorage.setItem('mobile-use.token', value);
@@ -284,6 +289,7 @@ function App() {
   const manage = ['admin', 'operator'].includes(actor.role);
   const canAddDevice = manage || (actor.role === 'owner' && Boolean(oidc?.companion_enabled));
   const device = devices.find((item) => item.id === selected);
+  const canRemoveDevice = manage || (actor.role === 'owner' && device?.owner === actor.subject);
   const deviceSessions = sessions.filter((item) => item.device_id === selected);
   const active = deviceSessions.find((item) => item.state === 'active');
   const change = (session: Session, verb: string) =>
@@ -459,9 +465,23 @@ function App() {
                               {device.virtual ? ' · virtual' : ''}
                             </CardDescription>
                           </div>
-                          <Badge variant={device.online ? 'secondary' : 'outline'}>
-                            {device.online ? 'Online' : 'Offline'}
-                          </Badge>
+                          <div className="flex flex-wrap items-center justify-end gap-2">
+                            <Badge variant={device.online ? 'secondary' : 'outline'}>
+                              {device.online ? 'Online' : 'Offline'}
+                            </Badge>
+                            {canRemoveDevice && (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="destructive"
+                                disabled={busy}
+                                onClick={() => setRemoveTarget(device)}
+                              >
+                                <Trash2 data-icon="inline-start" />
+                                Remove
+                              </Button>
+                            )}
+                          </div>
                         </CardHeader>
                         <CardContent className="grid gap-4">
                           <div className="flex flex-wrap gap-2">
@@ -491,7 +511,7 @@ function App() {
                               actor={actor}
                               session={active}
                               supportsVideo={device.live_video}
-                              supportsNavKeys={device.mode !== 'companion'}
+                              supportsNavKeys={device.platform === 'android' && device.mode === 'adb'}
                               supportsFrameStream={device.mode === 'companion'}
                               captureRevision={captureRevision}
                               onError={setError}
@@ -684,6 +704,39 @@ function App() {
                 </Card>
               )}
             </main>
+            <AlertDialog
+              open={Boolean(removeTarget)}
+              onOpenChange={(open) => {
+                if (!open) setRemoveTarget(undefined);
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Remove {removeTarget?.label} from inventory?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Active sessions will end and access will be revoked. A companion phone will need to
+                    be paired again before it can reconnect.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel disabled={busy}>Keep device</AlertDialogCancel>
+                  <AlertDialogAction
+                    disabled={busy || !removeTarget}
+                    onClick={() => {
+                      const id = removeTarget?.id;
+                      if (!id) return;
+                      void run(async () => {
+                        await api(token, `/v1/devices/${id}`, 'DELETE');
+                        setSelected('');
+                      });
+                      setRemoveTarget(undefined);
+                    }}
+                  >
+                    Remove device
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
             <Sheet open={showAddDevice} onOpenChange={setShowAddDevice}>
               <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-3xl">
                 <SheetHeader className="sr-only">
@@ -1378,6 +1431,9 @@ function Viewer({
   onError: (message: string) => void;
 }) {
   const [frame, setFrame] = useState<Observation>();
+  const [treeObservation, setTreeObservation] = useState<Observation>();
+  const [treeOpen, setTreeOpen] = useState(false);
+  const [treeQuery, setTreeQuery] = useState('');
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState(Boolean(supportsFrameStream));
@@ -1387,19 +1443,40 @@ function Viewer({
   const [streamMessage, setStreamMessage] = useState('');
   const [live, setLive] = useState(false);
   const [pageVisible, setPageVisible] = useState(() => !document.hidden);
-  const start = useRef<{ x: number; y: number } | undefined>(undefined);
+  const [touchMode, setTouchMode] = useState<TouchMode>('direct');
+  const [hardwareKey, setHardwareKey] = useState<AndroidKey>('enter');
+  const pointers = useRef(new Map<number, ScreenPointer>());
   const base = `/v1/sessions/${session.id}`;
   const owner = session.owner === actor.subject && actor.role !== 'agent';
   const controller =
     !session.paused && session.controller === actor.subject && session.capabilities.includes('touch');
+  const treeNodes = treeObservation?.nodes ?? [];
+  const treeNodeById = new Map(treeNodes.map((node) => [node.id, node]));
+  const normalizedTreeQuery = treeQuery.trim().toLocaleLowerCase();
+  const matchingTreeNodes = treeNodes.filter((node) =>
+    !normalizedTreeQuery || [node.label, node.hint, node.role, node.resource_id]
+      .some((value) => value?.toLocaleLowerCase().includes(normalizedTreeQuery)),
+  );
+  const shownTreeNodes = matchingTreeNodes.slice(0, 200);
+  function treeDepth(node: (typeof treeNodes)[number]) {
+    let depth = 0;
+    let parentId = node.parent_id;
+    while (parentId && depth < 8) {
+      const parent = treeNodeById.get(parentId);
+      if (!parent) break;
+      depth += 1;
+      parentId = parent.parent_id;
+    }
+    return depth;
+  }
 
-  const observe = useCallback(async () => {
+  const observe = useCallback(async (includeTree = false) => {
     for (let attempt = 0; ; attempt += 1) {
       const result = await api<{ observation?: Observation; error?: { code: string; message: string } }>(
         token,
         `${base}/operations`,
         'POST',
-        { kind: 'observe', observe: { screen: true, tree: false } },
+        { kind: 'observe', observe: { screen: true, tree: includeTree } },
       );
       if (!result.error) return result.observation;
       if (
@@ -1411,6 +1488,22 @@ function Viewer({
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
   }, [token, base]);
+
+  async function inspectTree() {
+    if (busy) return;
+    setBusy(true);
+    onError('');
+    try {
+      const next = await observe(true);
+      setFrame(next);
+      setTreeObservation(next);
+      setTreeOpen(true);
+    } catch (error) {
+      onError(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     const updateVisibility = () => setPageVisible(!document.hidden);
@@ -1424,17 +1517,19 @@ function Viewer({
       setStreamMessage('');
       return;
     }
-    const abort = new AbortController();
     let closed = false;
+    let connection: AbortController | undefined;
     let retryDelay = 500;
     const connect = async () => {
       while (!closed) {
+        const current = new AbortController();
+        connection = current;
         try {
           setStreamMessage('');
           setStreamState((current) => (current === 'streaming' ? current : 'connecting'));
           const response = await fetch(`/v1/companion/sessions/${session.id}/frames`, {
             headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
-            signal: abort.signal,
+            signal: current.signal,
             redirect: 'error',
           });
           if (!response.ok || !response.body) {
@@ -1454,8 +1549,36 @@ function Viewer({
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          let lastFrameAt = 0;
           while (!closed) {
-            const { value, done } = await reader.read();
+            let timeout = 0;
+            const pending = reader.read();
+            let next: Awaited<ReturnType<typeof reader.read>>;
+            try {
+              next = lastFrameAt
+                ? await Promise.race([
+                  pending,
+                  new Promise<never>((_, reject) => {
+                    const remaining = Math.max(100, 3500 - (Date.now() - lastFrameAt));
+                    timeout = window.setTimeout(
+                      () => reject(new Error('No new screen frames arrived. Reconnecting to the phone…')),
+                      remaining,
+                    );
+                  }),
+                  ])
+                : await Promise.race([
+                  pending,
+                  new Promise<never>((_, reject) => {
+                    timeout = window.setTimeout(
+                      () => reject(new Error('The screen stream is not responding. Reconnecting…')),
+                      12000,
+                    );
+                  }),
+                  ]);
+            } finally {
+              window.clearTimeout(timeout);
+            }
+            const { value, done } = next;
             if (done) break;
             buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
             let boundary = buffer.indexOf('\n\n');
@@ -1471,9 +1594,14 @@ function Viewer({
               if (data.length) {
                 if (event === 'frame') {
                   const next = JSON.parse(data.join('\n')) as Observation;
-                  if (next.image) setFrame(next);
+                  if (next.image) {
+                    lastFrameAt = Date.now();
+                    setFrame(next);
+                  }
+                  setStreamMessage('');
                   setStreamState('streaming');
                 } else if (event === 'status') {
+                  lastFrameAt = 0;
                   setStreamState('waiting');
                 }
               }
@@ -1482,18 +1610,21 @@ function Viewer({
           }
           if (!closed) throw new Error('The companion screen stream disconnected.');
         } catch (error) {
-          if (closed || abort.signal.aborted) return;
+          if (closed) return;
           setStreamMessage(errorText(error));
           setStreamState('reconnecting');
           await new Promise((resolve) => window.setTimeout(resolve, retryDelay));
           retryDelay = Math.min(3000, retryDelay * 2);
+        } finally {
+          if (connection === current) connection = undefined;
+          current.abort();
         }
       }
     };
     void connect();
     return () => {
       closed = true;
-      abort.abort();
+      connection?.abort();
     };
   }, [pageVisible, preview, session.id, session.paused, supportsFrameStream, token]);
 
@@ -1540,9 +1671,12 @@ function Viewer({
   }, [session.paused, supportsVideo]);
 
   useEffect(() => {
-    start.current = undefined;
+    pointers.current.clear();
     setFrame(undefined);
-  }, [captureRevision, session.paused]);
+    setTreeObservation(undefined);
+    setTreeOpen(false);
+    setTreeQuery('');
+  }, [captureRevision, session.id, session.paused]);
 
   async function perform(action?: Record<string, unknown>) {
     if (busy) return;
@@ -1553,11 +1687,13 @@ function Viewer({
         const result = await api<{ error?: { message: string } }>(token, `${base}/operations`, 'POST', {
           id: crypto.randomUUID(),
           kind: 'act',
-          action: { ...action, frame_id: frame.frame_id },
+          action: { ...action, frame_id: action.frame_id || frame.frame_id },
         });
         if (result.error) throw new Error(result.error.message);
       }
-      setFrame(await observe());
+      const next = await observe(Boolean(treeObservation));
+      setFrame(next);
+      if (treeObservation) setTreeObservation(next);
     } catch (error) {
       onError(errorText(error));
     } finally {
@@ -1631,6 +1767,11 @@ function Viewer({
               {live ? 'Stop video' : 'Live video'}
             </Button>
           )}
+          {session.capabilities.includes('ui_tree') && (
+            <Button type="button" variant="outline" onClick={inspectTree} disabled={busy}>
+              Inspect UI tree
+            </Button>
+          )}
           {!live && !controller && !session.paused && (
             <Button
               type="button"
@@ -1667,21 +1808,71 @@ function Viewer({
               src={`data:${frame.image.mime};base64,${frame.image.data}`}
               onPointerDown={(event) => {
                 if (controller && !busy) {
+                  if ([...pointers.current.values()].every((pointer) => pointer.released)) pointers.current.clear();
                   event.currentTarget.setPointerCapture(event.pointerId);
-                  start.current = position(event);
+                  const point = position(event);
+                  pointers.current.set(event.pointerId, { start: point, end: point, released: false });
                 }
               }}
-              onPointerCancel={() => {
-                start.current = undefined;
+              onPointerMove={(event) => {
+                const pointer = pointers.current.get(event.pointerId);
+                if (pointer && !pointer.released) pointer.end = position(event);
+              }}
+              onPointerCancel={(event) => {
+                pointers.current.clear();
               }}
               onPointerUp={(event) => {
-                if (!controller || !start.current) return;
-                const point = start.current;
-                start.current = undefined;
-                const end = position(event);
-                if (Math.hypot(point.x - end.x, point.y - end.y) > 0.04)
-                  perform({ type: 'swipe', point, end });
-                else perform({ type: 'tap', point });
+                if (!controller) return;
+                const pointer = pointers.current.get(event.pointerId);
+                if (!pointer) return;
+                pointer.end = position(event);
+                pointer.released = true;
+                const gesturePointers = [...pointers.current.values()];
+                if (!gesturePointers.every((item) => item.released)) return;
+                pointers.current.clear();
+                if (gesturePointers.length > 1) {
+                  if (!session.capabilities.includes('multi_touch')) {
+                    onError('This device does not advertise multi-touch support.');
+                    return;
+                  }
+                  if (gesturePointers.length > 5) {
+                    onError('A multi-touch gesture can include up to five fingers.');
+                    return;
+                  }
+                  const paths = gesturePointers.map(({ start: pathStart, end }) => ({ start: pathStart, end }));
+                  let gesture = 'multi_touch';
+                  if (paths.length === 2) {
+                    const width = Math.max(1, frame.width);
+                    const height = Math.max(1, frame.height);
+                    const distance = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+                      Math.hypot((a.x - b.x) * width, (a.y - b.y) * height);
+                    const startDistance = distance(paths[0].start, paths[1].start);
+                    const endDistance = distance(paths[0].end, paths[1].end);
+                    if (startDistance > 0 && Math.abs(endDistance / startDistance - 1) > 0.08) {
+                      gesture = 'pinch';
+                    } else if (paths.every((path) => path.start.x === path.end.x && path.start.y === path.end.y)) {
+                      gesture = 'two_finger_tap';
+                    } else {
+                      const angle = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+                        Math.atan2((b.y - a.y) * height, (b.x - a.x) * width);
+                      const startAngle = angle(paths[0].start, paths[1].start);
+                      const endAngle = angle(paths[0].end, paths[1].end);
+                      let delta = Math.abs(endAngle - startAngle);
+                      if (delta > Math.PI) delta = 2 * Math.PI - delta;
+                      if (delta > Math.PI / 12) gesture = 'rotate';
+                    }
+                  }
+                  perform({ type: gesture, paths });
+                  return;
+                }
+                const [{ start: point, end }] = gesturePointers;
+                const moved = Math.hypot(point.x - end.x, point.y - end.y) > 0.04;
+                const type = touchMode === 'direct'
+                  ? moved ? 'swipe' : 'tap'
+                  : touchMode;
+                if (type === 'swipe' || type === 'drag' || type === 'scroll' || type === 'fling')
+                  perform({ type, point, end });
+                else perform({ type, point });
               }}
             />
           ) : (
@@ -1704,6 +1895,32 @@ function Viewer({
             </Empty>
           )}
         </div>
+        {controller && !live && (
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/30 p-3">
+            <span className="text-sm font-medium">Screen gesture</span>
+            <Select value={touchMode} onValueChange={(value) => setTouchMode(value as TouchMode)}>
+              <SelectTrigger className="w-40" aria-label="Screen gesture mode">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="direct">Direct</SelectItem>
+                  <SelectItem value="tap">Tap</SelectItem>
+                  <SelectItem value="double_tap">Double tap</SelectItem>
+                  <SelectItem value="long_press">Long press</SelectItem>
+                  <SelectItem value="swipe">Swipe</SelectItem>
+                  <SelectItem value="drag">Drag</SelectItem>
+                  <SelectItem value="scroll">Scroll</SelectItem>
+                  <SelectItem value="fling">Fling</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Direct mode maps a tap or swipe. Use two fingers for pinch, rotate, or two-finger tap; more fingers send a multi-touch path.
+              {!session.capabilities.includes('multi_touch') && ' Multi-touch is not enabled for this session.'}
+            </p>
+          </div>
+        )}
         {supportsFrameStream && streamMessage && (
           <Alert variant={streamState === 'error' ? 'destructive' : 'default'}>
             <AlertCircle />
@@ -1712,6 +1929,146 @@ function Viewer({
             </AlertTitle>
             <AlertDescription>{streamMessage}</AlertDescription>
           </Alert>
+        )}
+        {treeOpen && treeObservation && (
+          <Card>
+            <CardHeader className="flex flex-row items-start justify-between gap-3">
+              <div className="grid gap-1">
+                <CardTitle className="text-base">Accessible UI tree</CardTitle>
+                <CardDescription>
+                  {treeObservation.nodes?.length || 0} elements · captured at {time(treeObservation.captured_at)}
+                </CardDescription>
+              </div>
+              <div className="flex gap-2">
+                <Button type="button" size="sm" variant="outline" onClick={inspectTree} disabled={busy}>
+                  Refresh
+                </Button>
+                <Button type="button" size="sm" variant="ghost" onClick={() => setTreeOpen(false)}>
+                  Hide
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              <Input
+                value={treeQuery}
+                onChange={(event) => setTreeQuery(event.target.value)}
+                placeholder="Filter by label, hint, role, or resource ID"
+                aria-label="Filter accessible UI elements"
+              />
+              {!!treeObservation.partial?.length && (
+                <Alert>
+                  <AlertDescription>{treeObservation.partial.join(' · ')}</AlertDescription>
+                </Alert>
+              )}
+              {shownTreeNodes.length ? (
+                <ScrollArea className="h-72 rounded-md border">
+                  <div className="divide-y">
+                    {shownTreeNodes.map((node) => (
+                      <div key={node.id} className="flex items-center gap-3 py-2 pr-3" style={{ paddingLeft: `${12 + treeDepth(node) * 12}px` }}>
+                        <div className="grid min-w-0 flex-1 gap-1">
+                          <span className="truncate text-sm font-medium">
+                            {node.label || node.hint || node.resource_id || node.role || 'UI element'}
+                          </span>
+                          <span className="truncate text-xs text-muted-foreground">
+                            {[node.role, node.resource_id, `${node.bounds.x},${node.bounds.y} · ${node.bounds.width}×${node.bounds.height} px`]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                          <div className="flex flex-wrap gap-1">
+                            {node.clickable && <Badge variant="secondary">Clickable</Badge>}
+                            {node.long_clickable && <Badge variant="outline">Long press</Badge>}
+                            {node.editable && <Badge variant="outline">Editable</Badge>}
+                            {node.focusable && <Badge variant="outline">Focusable</Badge>}
+                            {node.focused && <Badge variant="secondary">Focused</Badge>}
+                            {node.checkable && <Badge variant="outline">Checkable</Badge>}
+                            {node.scrollable && <Badge variant="outline">Scrollable</Badge>}
+                            {node.checked && <Badge variant="outline">Checked</Badge>}
+                            {node.selected && <Badge variant="outline">Selected</Badge>}
+                            {node.protected && <Badge variant="destructive">Protected</Badge>}
+                            {!node.enabled && <Badge variant="outline">Disabled</Badge>}
+                            {!node.visible && <Badge variant="outline">Hidden</Badge>}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 flex-wrap justify-end gap-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={busy || !controller || !node.enabled || !node.visible}
+                            onClick={() =>
+                              perform({ type: 'tap', node_id: node.id, frame_id: treeObservation.frame_id })
+                            }
+                          >
+                            Tap
+                          </Button>
+                          {node.long_clickable && (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              disabled={busy || !controller || !node.enabled || !node.visible}
+                              onClick={() =>
+                                perform({ type: 'long_press', node_id: node.id, frame_id: treeObservation.frame_id })
+                              }
+                            >
+                              Hold
+                            </Button>
+                          )}
+                          {node.scrollable && (
+                            <>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                aria-label="Swipe up within this element"
+                                disabled={busy || !controller || !node.enabled || !node.visible}
+                                onClick={() =>
+                                  perform({ type: 'scroll', node_id: node.id, direction: 'up', frame_id: treeObservation.frame_id })
+                                }
+                              >
+                                ↑
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                aria-label="Swipe down within this element"
+                                disabled={busy || !controller || !node.enabled || !node.visible}
+                                onClick={() =>
+                                  perform({ type: 'scroll', node_id: node.id, direction: 'down', frame_id: treeObservation.frame_id })
+                                }
+                              >
+                                ↓
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </ScrollArea>
+              ) : (
+                <Empty className="border-0">
+                  <EmptyHeader>
+                    <EmptyTitle>{treeNodes.length && normalizedTreeQuery ? 'No matching elements' : 'No accessible elements found'}</EmptyTitle>
+                    <EmptyDescription>
+                      {treeNodes.length && normalizedTreeQuery
+                        ? 'Try a shorter label, role, hint, or resource ID.'
+                        : 'The current device may not expose a UI hierarchy, or this screen has no accessible controls.'}
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  {!!treeNodes.length && !!normalizedTreeQuery && (
+                    <EmptyContent>
+                      <Button type="button" variant="outline" onClick={() => setTreeQuery('')}>Clear filter</Button>
+                    </EmptyContent>
+                  )}
+                </Empty>
+              )}
+              {matchingTreeNodes.length > shownTreeNodes.length && (
+                <p className="text-xs text-muted-foreground">Showing {shownTreeNodes.length} of {matchingTreeNodes.length} matching elements. Refine the filter or use MCP to query the full tree.</p>
+              )}
+            </CardContent>
+          </Card>
         )}
         {controller && frame && !live && (
           <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/30 p-3">
@@ -1741,11 +2098,60 @@ function Viewer({
                 type="button"
                 size="sm"
                 variant="outline"
+                onClick={() => perform({ type: 'key', key: 'notification_shade' })}
+                disabled={busy}
+              >
+                Notifications
+              </Button>
+            )}
+            {supportsNavKeys && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => perform({ type: 'key', key: 'quick_settings' })}
+                disabled={busy}
+              >
+                Quick settings
+              </Button>
+            )}
+            {supportsNavKeys && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
                 onClick={() => perform({ type: 'key', key: 'overview' })}
                 disabled={busy}
               >
                 Overview
               </Button>
+            )}
+            {supportsNavKeys && (
+              <div className="flex min-w-[min(100%,18rem)] flex-1 gap-2">
+                <Select value={hardwareKey} onValueChange={(value) => setHardwareKey(value as AndroidKey)}>
+                  <SelectTrigger className="min-w-40 flex-1" aria-label="Android hardware key">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="enter">Enter</SelectItem>
+                      <SelectItem value="tab">Tab</SelectItem>
+                      <SelectItem value="escape">Escape</SelectItem>
+                      <SelectItem value="menu">Menu</SelectItem>
+                      <SelectItem value="dpad_up">D-pad up</SelectItem>
+                      <SelectItem value="dpad_down">D-pad down</SelectItem>
+                      <SelectItem value="dpad_left">D-pad left</SelectItem>
+                      <SelectItem value="dpad_right">D-pad right</SelectItem>
+                      <SelectItem value="volume_up">Volume up</SelectItem>
+                      <SelectItem value="volume_down">Volume down</SelectItem>
+                      <SelectItem value="volume_mute">Mute</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <Button type="button" variant="outline" onClick={() => perform({ type: 'key', key: hardwareKey })} disabled={busy}>
+                  Press key
+                </Button>
+              </div>
             )}
             {session.capabilities.includes('text') && (
               <form

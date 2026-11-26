@@ -289,7 +289,10 @@ export function McpSetup({
         <AlertDescription>
           Tools depend on device mode and the capabilities granted to that agent. Screen, touch, app
           discovery, keyboard input, navigation, and approved app installs are controlled by per-device grants
-          and session approval.
+          and session approval. Use <code>ui_find</code> and <code>ui_action</code> for accessibility-aware
+          targeting, and <code>touch_gesture</code> for coordinate and multi-touch gestures when advertised.
+          Android multi-touch needs the ADB helper enabled on the workstation. The Android companion currently
+          shares its screen and approved sensors; input, UI-tree, and app controls require ADB or Appium.
         </AlertDescription>
       </Alert>
     </div>

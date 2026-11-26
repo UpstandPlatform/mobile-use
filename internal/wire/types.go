@@ -217,16 +217,47 @@ type Point struct {
 }
 
 type Action struct {
-	Type        string `json:"type"`
-	FrameID     string `json:"frame_id,omitempty"`
-	NodeID      string `json:"node_id,omitempty"`
-	Point       *Point `json:"point,omitempty"`
-	End         *Point `json:"end,omitempty"`
-	SecondPoint *Point `json:"second_point,omitempty"`
-	SecondEnd   *Point `json:"second_end,omitempty"`
-	DurationMS  int    `json:"duration_ms,omitempty"`
-	Text        string `json:"text,omitempty"`
-	Key         string `json:"key,omitempty"`
+	Type        string      `json:"type"`
+	FrameID     string      `json:"frame_id,omitempty"`
+	NodeID      string      `json:"node_id,omitempty"`
+	Point       *Point      `json:"point,omitempty"`
+	End         *Point      `json:"end,omitempty"`
+	SecondPoint *Point      `json:"second_point,omitempty"`
+	SecondEnd   *Point      `json:"second_end,omitempty"`
+	Paths       []TouchPath `json:"paths,omitempty"`
+	Direction   string      `json:"direction,omitempty"`
+	DurationMS  int         `json:"duration_ms,omitempty"`
+	Text        string      `json:"text,omitempty"`
+	Key         string      `json:"key,omitempty"`
+}
+
+// TouchPath describes one finger's normalized viewport path. Identical start and end
+// points represent a stationary touch; multiple paths run concurrently.
+type TouchPath struct {
+	Start Point `json:"start"`
+	End   Point `json:"end"`
+}
+
+func (a Action) GesturePaths() []TouchPath {
+	if len(a.Paths) > 0 {
+		return a.Paths
+	}
+	if a.Point == nil {
+		return nil
+	}
+	end := *a.Point
+	if a.End != nil {
+		end = *a.End
+	}
+	paths := []TouchPath{{Start: *a.Point, End: end}}
+	if a.SecondPoint != nil {
+		secondEnd := *a.SecondPoint
+		if a.SecondEnd != nil {
+			secondEnd = *a.SecondEnd
+		}
+		paths = append(paths, TouchPath{Start: *a.SecondPoint, End: secondEnd})
+	}
+	return paths
 }
 
 type BrowserRequest struct {
@@ -264,17 +295,29 @@ type Rect struct {
 }
 
 type Node struct {
-	ID         string `json:"id"`
-	ParentID   string `json:"parent_id,omitempty"`
-	Role       string `json:"role,omitempty"`
-	Label      string `json:"label,omitempty"`
-	ResourceID string `json:"resource_id,omitempty"`
-	Bounds     Rect   `json:"bounds"`
-	Enabled    bool   `json:"enabled"`
-	Clickable  bool   `json:"clickable"`
-	Protected  bool   `json:"protected,omitempty"`
-	Focused    bool   `json:"focused,omitempty"`
+	ID              string `json:"id"`
+	ParentID        string `json:"parent_id,omitempty"`
+	Role            string `json:"role,omitempty"`
+	Label           string `json:"label,omitempty"`
+	Hint            string `json:"hint,omitempty"`
+	ResourceID      string `json:"resource_id,omitempty"`
+	Bounds          Rect   `json:"bounds"`
+	Enabled         bool   `json:"enabled"`
+	Visible         bool   `json:"visible"`
+	VisibilityKnown bool   `json:"-"`
+	Clickable       bool   `json:"clickable"`
+	LongClickable   bool   `json:"long_clickable,omitempty"`
+	Focusable       bool   `json:"focusable,omitempty"`
+	Editable        bool   `json:"editable,omitempty"`
+	Checkable       bool   `json:"checkable,omitempty"`
+	Checked         bool   `json:"checked,omitempty"`
+	Selected        bool   `json:"selected,omitempty"`
+	Scrollable      bool   `json:"scrollable,omitempty"`
+	Protected       bool   `json:"protected,omitempty"`
+	Focused         bool   `json:"focused,omitempty"`
 }
+
+func (n Node) IsVisible() bool { return !n.VisibilityKnown || n.Visible }
 
 type BrowserContext struct {
 	ID    string `json:"id"`
@@ -392,30 +435,74 @@ func (op Operation) Required() ([]Capability, error) {
 		if a == nil || a.DurationMS < 0 || a.DurationMS > 3000 {
 			return nil, invalid
 		}
-		switch a.Type {
-		case "tap", "long_press":
-			if !ValidID(a.FrameID) || (a.Point != nil) == (a.NodeID != "") || a.Point != nil && !a.Point.valid() || a.NodeID != "" && !ValidID(a.NodeID) {
-				return nil, invalid
+		validNodeTarget := func() bool {
+			return ValidID(a.FrameID) && a.NodeID != "" && ValidID(a.NodeID) && a.Point == nil && a.End == nil &&
+				a.SecondPoint == nil && a.SecondEnd == nil && len(a.Paths) == 0
+		}
+		validPointTarget := func() bool {
+			return ValidID(a.FrameID) && a.NodeID == "" && a.Point != nil && a.Point.valid() && len(a.Paths) == 0 &&
+				a.SecondPoint == nil && a.SecondEnd == nil
+		}
+		validNodeScroll := func() bool {
+			return ValidID(a.FrameID) && a.NodeID != "" && ValidID(a.NodeID) && a.Point == nil && a.End == nil &&
+				a.SecondPoint == nil && a.SecondEnd == nil && len(a.Paths) == 0 &&
+				slices.Contains([]string{"up", "down", "left", "right"}, a.Direction)
+		}
+		validPaths := func(countMin, countMax int) bool {
+			if !ValidID(a.FrameID) || a.NodeID != "" || a.Point != nil || a.End != nil || a.SecondPoint != nil || a.SecondEnd != nil ||
+				len(a.Paths) < countMin || len(a.Paths) > countMax {
+				return false
 			}
-			return []Capability{Touch}, nil
-		case "swipe", "drag", "pinch":
-			if !ValidID(a.FrameID) || !a.Point.valid() || !a.End.valid() {
-				return nil, invalid
-			}
-			if a.Type == "pinch" {
-				if !a.SecondPoint.valid() || !a.SecondEnd.valid() {
-					return nil, invalid
+			for _, path := range a.Paths {
+				if !path.Start.valid() || !path.End.valid() {
+					return false
 				}
-				return []Capability{Touch, MultiTouch}, nil
+			}
+			return true
+		}
+		switch a.Type {
+		case "tap", "double_tap", "long_press":
+			if !(validNodeTarget() || validPointTarget() || validPaths(1, 1) && a.Paths[0].Start == a.Paths[0].End) {
+				return nil, invalid
 			}
 			return []Capability{Touch}, nil
+		case "swipe", "drag", "scroll", "fling":
+			if a.Type == "scroll" && validNodeScroll() {
+				return []Capability{Touch}, nil
+			}
+			validLegacy := ValidID(a.FrameID) && a.NodeID == "" && a.Point.valid() && a.End.valid() && len(a.Paths) == 0 &&
+				a.SecondPoint == nil && a.SecondEnd == nil
+			if !(validLegacy || validPaths(1, 1)) {
+				return nil, invalid
+			}
+			return []Capability{Touch}, nil
+		case "pinch", "rotate", "two_finger_tap":
+			validLegacy := ValidID(a.FrameID) && a.NodeID == "" && a.Point.valid() && a.End.valid() &&
+				a.SecondPoint.valid() && a.SecondEnd.valid() && len(a.Paths) == 0
+			if !(validLegacy || validPaths(2, 2)) {
+				return nil, invalid
+			}
+			paths := a.GesturePaths()
+			if a.Type == "two_finger_tap" && (paths[0].Start != paths[0].End || paths[1].Start != paths[1].End) {
+				return nil, invalid
+			}
+			return []Capability{Touch, MultiTouch}, nil
+		case "multi_touch":
+			if !validPaths(2, 5) {
+				return nil, invalid
+			}
+			return []Capability{Touch, MultiTouch}, nil
 		case "type":
 			if !ValidID(a.FrameID) || a.Text == "" || len(a.Text) > 4096 || strings.ContainsRune(a.Text, 0) {
 				return nil, invalid
 			}
 			return []Capability{Text}, nil
 		case "key":
-			if !ValidID(a.FrameID) || !slices.Contains([]string{"home", "back", "overview", "enter", "backspace", "volume_up", "volume_down"}, a.Key) {
+			if !ValidID(a.FrameID) || !slices.Contains([]string{
+				"home", "back", "overview", "enter", "backspace", "tab", "escape", "menu",
+				"dpad_up", "dpad_down", "dpad_left", "dpad_right", "volume_up", "volume_down", "volume_mute",
+				"notification_shade", "quick_settings",
+			}, a.Key) {
 				return nil, invalid
 			}
 			return []Capability{Touch}, nil

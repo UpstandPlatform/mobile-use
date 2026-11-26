@@ -177,6 +177,17 @@ func (s *Service) HTTP(options HTTPOptions) http.Handler {
 		}
 		respond(w, 200, device, err)
 	}))
+	protected.HandleFunc("DELETE /v1/devices/{id}", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
+		target, err := s.Store.RemoveDevice(r.Context(), actor, r.PathValue("id"), time.Now())
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if target.Session != "" || strings.HasPrefix(target.Connector, "companion.") {
+			s.stop(r.Context(), target)
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"removed": true})
+	}))
 	protected.HandleFunc("GET /v1/sessions", withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		sessions, err := s.Store.Sessions(r.Context(), actor)
 		respond(w, 200, sessions, err)

@@ -435,12 +435,20 @@ export function Downloads({ systemInfo }: { systemInfo?: SystemInfo }) {
                 artifact={{
                   name: controlName,
                   title: 'Android control helper APK',
-                  detail: 'Optional ADB helper for Unicode text and pinch gestures',
+                  detail: 'Optional ADB helper for Unicode text and Android multi-touch gestures',
                   size: control?.size,
                 }}
                 href={directUrl(controlName)}
                 unavailable={!directUrl(controlName)}
               />
+              <Alert>
+                <CircleHelp />
+                <AlertTitle>Enable Android Unicode and multi-touch</AlertTitle>
+                <AlertDescription>
+                  Install the helper on the phone with <code>adb install -r &lt;downloaded-apk&gt;</code>, then restart the workstation with
+                  {' '}<code>--android-control-helper</code>. Connect the phone over USB or Wireless Debugging; the device capability list will show Multi-touch when ready.
+                </AlertDescription>
+              </Alert>
               <ReleaseDownload
                 artifact={{
                   name: sdkName,

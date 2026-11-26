@@ -19,14 +19,48 @@ export type Session = {
   expires_at: string;
 };
 export type Point = { x: number; y: number };
-type Target = { point: Point; node_id?: never } | { node_id: string; point?: never };
-type Action = { frame_id: string } & (
-  | ({ type: 'tap' | 'long_press'; duration_ms?: number } & Target)
-  | { type: 'swipe' | 'drag'; duration_ms?: number; point: Point; end: Point }
-  | { type: 'pinch'; duration_ms?: number; point: Point; end: Point; second_point: Point; second_end: Point }
-  | { type: 'type'; text: string }
-  | { type: 'key'; key: 'home' | 'back' | 'overview' | 'enter' | 'backspace' | 'volume_up' | 'volume_down' }
-);
+export type TouchPath = { start: Point; end: Point };
+export type UINode = {
+  id: string;
+  parent_id?: string;
+  role?: string;
+  label?: string;
+  hint?: string;
+  resource_id?: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  enabled: boolean;
+  visible: boolean;
+  clickable: boolean;
+  long_clickable?: boolean;
+  focusable?: boolean;
+  editable?: boolean;
+  checkable?: boolean;
+  checked?: boolean;
+  selected?: boolean;
+  scrollable?: boolean;
+  protected?: boolean;
+  focused?: boolean;
+};
+type PointTarget = { point: Point; node_id?: never };
+type NodeTarget = { node_id: string; point?: never };
+export type Action =
+  | ({ frame_id: string; type: 'tap' | 'double_tap' | 'long_press'; duration_ms?: number } &
+      (PointTarget | NodeTarget | { paths: [TouchPath] }))
+  | ({ frame_id: string; type: 'swipe' | 'drag' | 'fling'; duration_ms?: number } &
+      ({ point: Point; end: Point } | { paths: [TouchPath] }))
+  | ({ frame_id: string; type: 'scroll'; duration_ms?: number; direction?: 'up' | 'down' | 'left' | 'right' } &
+      ({ point: Point; end: Point } | { node_id: string } | { paths: [TouchPath] }))
+  | ({ frame_id: string; type: 'pinch' | 'rotate'; duration_ms?: number } &
+      ({ paths: [TouchPath, TouchPath] } | { point: Point; end: Point; second_point: Point; second_end: Point }))
+  | ({ frame_id: string; type: 'two_finger_tap'; duration_ms?: number } &
+      ({ paths: [TouchPath, TouchPath] } | { point: Point; end: Point; second_point: Point; second_end: Point }))
+  | { frame_id: string; type: 'multi_touch'; duration_ms?: number; paths: [TouchPath, TouchPath, ...TouchPath[]] }
+  | { frame_id: string; type: 'type'; text: string }
+  | { frame_id: string; type: 'key'; key: NavigationKey };
+export type NavigationKey =
+  | 'home' | 'back' | 'overview' | 'enter' | 'backspace' | 'tab' | 'escape' | 'menu'
+  | 'dpad_up' | 'dpad_down' | 'dpad_left' | 'dpad_right' | 'volume_up' | 'volume_down'
+  | 'volume_mute' | 'notification_shade' | 'quick_settings';
 type BrowserAction = { context_id: string; document_id: string } & (
   | { type: 'navigate'; url: string }
   | { type: 'click'; selector: string }
@@ -56,7 +90,9 @@ export type Result = {
     height: number;
     app_id?: string;
     image?: Artifact;
-    nodes?: { id: string; label?: string; resource_id?: string }[];
+    orientation?: string;
+    nodes?: UINode[];
+    partial?: string[];
   };
   apps?: string[];
   contexts?: { id: string; title?: string; url?: string }[];

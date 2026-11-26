@@ -12,6 +12,14 @@ import org.junit.Test
 
 class PairingTest {
     @Test
+    fun screenFrameWebSocketKeepsTheSecureHttpUrlForUpgrade() {
+        assertEquals(
+            "https://mobile-use.example.com/companion/sessions/session-123/frames",
+            screenFrameStreamUrl("https://mobile-use.example.com/", "session-123"),
+        )
+    }
+
+    @Test
     fun parseLanPairingUriAndQrRoundTrip() {
         val pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         val uri = "mobile-use://pair?o=https%3A%2F%2F192.168.1.42%3A8444&c=K7M9-P4X2&p=$pin&n=Workstation&m=lan"

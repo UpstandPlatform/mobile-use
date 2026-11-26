@@ -83,11 +83,50 @@ func (s *Store) migrate(ctx context.Context) error {
 				return err
 			}
 		}
+		if err := s.ensureDeviceRemovedColumn(ctx, tx); err != nil {
+			return err
+		}
 		if s.postgres {
 			return activateRLS(ctx, tx)
 		}
 		return nil
 	})
+}
+
+func (s *Store) ensureDeviceRemovedColumn(ctx context.Context, tx *sql.Tx) error {
+	if s.postgres {
+		_, err := tx.ExecContext(ctx, "ALTER TABLE devices ADD COLUMN IF NOT EXISTS removed INTEGER NOT NULL DEFAULT 0")
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(devices)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "removed" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, "ALTER TABLE devices ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
+	return err
 }
 
 func (s *Store) query(statement string) string {
@@ -169,18 +208,19 @@ type deviceRow struct {
 	until      time.Time
 	generation int64
 	active     string
+	removed    bool
 }
 
 type scanner interface{ Scan(...any) error }
 
-const deviceCols = "inventory, connector, label, owner, profile, grants, enabled, online_until, generation, active_session"
+const deviceCols = "inventory, connector, label, owner, profile, grants, enabled, online_until, generation, active_session, removed"
 
 func readDevice(row scanner, now time.Time) (deviceRow, error) {
 	var d deviceRow
 	var inventory, grants, label string
 	var onlineUntil int64
-	var enabled int
-	err := row.Scan(&inventory, &d.Connector, &label, &d.Owner, &d.Profile, &grants, &enabled, &onlineUntil, &d.generation, &d.active)
+	var enabled, removed int
+	err := row.Scan(&inventory, &d.Connector, &label, &d.Owner, &d.Profile, &grants, &enabled, &onlineUntil, &d.generation, &d.active, &removed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, wire.ErrNotFound
 	}
@@ -199,6 +239,7 @@ func readDevice(row scanner, now time.Time) (deviceRow, error) {
 	d.until = time.UnixMilli(onlineUntil)
 	d.Online = now.Before(d.until)
 	d.Enabled = enabled == 1
+	d.removed = removed == 1
 	return d, nil
 }
 
@@ -215,6 +256,14 @@ func (s *Store) Register(ctx context.Context, workspace, connector string, items
 		for _, item := range items {
 			if !wire.ValidID(item.ID) || len(item.Label) > 128 || len(item.Catalog) > 64 || !slices.Contains([]string{"android", "ios"}, item.Platform) {
 				return wire.Error("INVALID_INVENTORY", "The device inventory is invalid.", 400)
+			}
+			var removed int
+			lookupErr := tx.QueryRowContext(ctx, s.query("SELECT removed FROM devices WHERE id = ? AND workspace = ? AND connector = ?"), item.ID, workspace, connector).Scan(&removed)
+			if lookupErr == nil && removed == 1 {
+				continue
+			}
+			if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+				return lookupErr
 			}
 			result, err := tx.ExecContext(ctx, s.query(`INSERT INTO devices(id, workspace, connector, inventory, online_until)
 				VALUES(?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET inventory = excluded.inventory, online_until = excluded.online_until
@@ -237,7 +286,7 @@ func (s *Store) Register(ctx context.Context, workspace, connector string, items
 
 func (s *Store) Devices(ctx context.Context, actor wire.Actor, now time.Time) ([]wire.Device, error) {
 	devices := []wire.Device{}
-	err := s.readRows(ctx, actor.Workspace, "SELECT "+deviceCols+" FROM devices WHERE workspace = ? ORDER BY label, id", []any{actor.Workspace}, func(rows *sql.Rows) error {
+	err := s.readRows(ctx, actor.Workspace, "SELECT "+deviceCols+" FROM devices WHERE workspace = ? AND removed = 0 ORDER BY label, id", []any{actor.Workspace}, func(rows *sql.Rows) error {
 		for rows.Next() {
 			d, err := readDevice(rows, now)
 			if err != nil {
@@ -303,6 +352,9 @@ func (s *Store) Enroll(ctx context.Context, actor wire.Actor, id string, update 
 		if err != nil {
 			return err
 		}
+		if d.removed {
+			return wire.ErrNotFound
+		}
 		if d.Mode == "companion" && update.Profile != wire.Personal {
 			return wire.Error("INVALID_PROFILE", "Companion-only enrollment requires an attended personal profile.", 400)
 		}
@@ -356,6 +408,65 @@ func (s *Store) Enroll(ctx context.Context, actor wire.Actor, id string, update 
 		return err
 	})
 	return result, stopped, err
+}
+
+func (s *Store) RemoveDevice(ctx context.Context, actor wire.Actor, id string, now time.Time) (Target, error) {
+	var target Target
+	err := s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
+		device, err := s.deviceLocked(ctx, tx, actor.Workspace, id, now)
+		if err != nil {
+			return err
+		}
+		if !actor.CanManage() && !(actor.Role == wire.Owner && actor.Subject == device.Owner) {
+			return wire.ErrForbidden
+		}
+		if device.removed {
+			return wire.ErrNotFound
+		}
+		target = Target{Workspace: actor.Workspace, Connector: device.Connector, Device: id, Session: device.active, Generation: device.generation}
+		if device.active != "" {
+			session, err := s.sessionTx(ctx, tx, actor.Workspace, device.active)
+			if err != nil {
+				return err
+			}
+			if err := s.closeLocked(ctx, tx, actor.Workspace, &session, wire.Ended, "device_removed"); err != nil {
+				return err
+			}
+		}
+		rows, err := tx.QueryContext(ctx, s.query("SELECT payload FROM sessions WHERE workspace = ? AND device = ? AND state = ?"), actor.Workspace, id, wire.Pending)
+		if err != nil {
+			return err
+		}
+		var pending []wire.Session
+		for rows.Next() {
+			session, err := decodeSession(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			pending = append(pending, session)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, session := range pending {
+			if err := s.closeLocked(ctx, tx, actor.Workspace, &session, wire.Ended, "device_removed"); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, s.query("DELETE FROM companions WHERE workspace = ? AND device = ?"), actor.Workspace, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.query("UPDATE devices SET enabled = 0, online_until = 0, removed = 1 WHERE workspace = ? AND id = ?"), actor.Workspace, id); err != nil {
+			return err
+		}
+		return s.audit(ctx, tx, actor, "device_removed", id, "", "", "removed", now)
+	})
+	return target, err
 }
 
 func (s *Store) sessionTx(ctx context.Context, tx *sql.Tx, workspace, id string) (wire.Session, error) {

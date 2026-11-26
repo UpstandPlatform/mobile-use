@@ -279,8 +279,18 @@ func (i *iosDevice) Tree(ctx context.Context) ([]wire.Node, error) {
 			label = ""
 		}
 		toInt := func(value string) int { result, _ := strconv.ParseFloat(value, 64); return int(result) }
-		return wire.Node{Role: element.Name.Local, Label: label, ResourceID: values["name"], Enabled: values["enabled"] != "false", Clickable: values["visible"] != "false",
-			Bounds: wire.Rect{X: toInt(values["x"]), Y: toInt(values["y"]), Width: toInt(values["width"]), Height: toInt(values["height"])}}, true
+		role := element.Name.Local
+		checkable := strings.Contains(role, "Switch") || strings.Contains(role, "Checkbox") || strings.Contains(role, "RadioButton")
+		editable := strings.Contains(role, "TextField") || strings.Contains(role, "TextView") || strings.Contains(role, "SearchField")
+		scrollable := strings.Contains(role, "ScrollView") || strings.Contains(role, "Table") || strings.Contains(role, "CollectionView") || values["scrollable"] == "true"
+		return wire.Node{
+			Role: role, Label: label, Hint: values["placeholderValue"], ResourceID: values["name"],
+			Enabled: values["enabled"] != "false", Visible: values["visible"] != "false", VisibilityKnown: true,
+			Clickable: values["accessible"] == "true", Focusable: values["focused"] == "true" || editable,
+			Editable: editable, Checkable: checkable, Checked: checkable && values["value"] == "1",
+			Selected: values["selected"] == "true", Scrollable: scrollable, Focused: values["focused"] == "true",
+			Bounds: wire.Rect{X: toInt(values["x"]), Y: toInt(values["y"]), Width: toInt(values["width"]), Height: toInt(values["height"])},
+		}, true
 	})
 }
 
@@ -296,11 +306,18 @@ func (i *iosDevice) Action(ctx context.Context, action wire.Action, display Disp
 	case "key":
 		switch action.Key {
 		case "home", "volume_up", "volume_down":
-			err = i.mobile(ctx, "pressButton", map[string]any{"name": strings.ReplaceAll(action.Key, "_", "")}, nil)
+			button := map[string]string{"home": "home", "volume_up": "volumeUp", "volume_down": "volumeDown"}[action.Key]
+			err = i.mobile(ctx, "pressButton", map[string]any{"name": button}, nil)
 		case "enter", "backspace":
 			value := "\uE007"
 			if action.Key == "backspace" {
 				value = "\uE003"
+			}
+			return i.sendKeys(ctx, value, []string{value})
+		case "tab", "escape":
+			value := "\uE004"
+			if action.Key == "escape" {
+				value = "\uE00C"
 			}
 			return i.sendKeys(ctx, value, []string{value})
 		default:
@@ -345,13 +362,21 @@ func (i *iosDevice) sendKeys(ctx context.Context, text string, values []string) 
 }
 
 func touchSources(action wire.Action, display Display, rect *wire.Rect) ([]map[string]any, error) {
-	var x, y int
+	paths := action.GesturePaths()
 	if rect != nil {
-		x, y = rect.X+rect.Width/2, rect.Y+rect.Height/2
-	} else {
-		x, y = Pixel(*action.Point, display)
+		if action.Type == "scroll" {
+			path, err := nodeScrollPath(*rect, display, action.Direction)
+			if err != nil {
+				return nil, err
+			}
+			paths = []wire.TouchPath{path}
+		} else {
+			x, y := rect.X+rect.Width/2, rect.Y+rect.Height/2
+			point := wire.Point{X: float64(x) / float64(display.Width), Y: float64(y) / float64(display.Height)}
+			paths = []wire.TouchPath{{Start: point, End: point}}
+		}
 	}
-	if x < 0 || x >= display.Width || y < 0 || y >= display.Height {
+	if len(paths) == 0 {
 		return nil, wire.ErrStale
 	}
 	duration := action.DurationMS
@@ -359,24 +384,36 @@ func touchSources(action wire.Action, display Display, rect *wire.Rect) ([]map[s
 		duration = 350
 		if action.Type == "long_press" {
 			duration = 650
+		} else if action.Type == "fling" {
+			duration = 120
+		} else if action.Type == "two_finger_tap" {
+			duration = 100
 		}
 	}
-	sequence := func(id string, px, py int, end *wire.Point) map[string]any {
+	sequence := func(id string, path wire.TouchPath) map[string]any {
+		px, py := Pixel(path.Start, display)
 		actions := []map[string]any{{"type": "pointerMove", "duration": 0, "x": px, "y": py, "origin": "viewport"}, {"type": "pointerDown", "button": 0}}
 		if action.Type == "long_press" || action.Type == "drag" {
 			actions = append(actions, map[string]any{"type": "pause", "duration": duration})
 		}
-		if end != nil {
-			nx, ny := Pixel(*end, display)
+		if action.Type == "double_tap" {
+			actions = append(actions,
+				map[string]any{"type": "pointerUp", "button": 0},
+				map[string]any{"type": "pause", "duration": 80},
+				map[string]any{"type": "pointerMove", "duration": 0, "x": px, "y": py, "origin": "viewport"},
+				map[string]any{"type": "pointerDown", "button": 0},
+			)
+		}
+		if path.End != path.Start {
+			nx, ny := Pixel(path.End, display)
 			actions = append(actions, map[string]any{"type": "pointerMove", "duration": duration, "x": nx, "y": ny, "origin": "viewport"})
 		}
 		actions = append(actions, map[string]any{"type": "pointerUp", "button": 0})
 		return map[string]any{"type": "pointer", "id": id, "parameters": map[string]any{"pointerType": "touch"}, "actions": actions}
 	}
-	result := []map[string]any{sequence("finger1", x, y, action.End)}
-	if action.Type == "pinch" {
-		x2, y2 := Pixel(*action.SecondPoint, display)
-		result = append(result, sequence("finger2", x2, y2, action.SecondEnd))
+	result := make([]map[string]any, 0, len(paths))
+	for index, path := range paths {
+		result = append(result, sequence(fmt.Sprintf("finger%d", index+1), path))
 	}
 	return result, nil
 }

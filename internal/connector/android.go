@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mobile-use/internal/wire"
@@ -27,6 +28,16 @@ type Android struct {
 	ScrcpyServer string
 	Catalog      *AndroidCatalog
 }
+
+type helperProbeResult struct {
+	checkedAt  time.Time
+	multiTouch bool
+}
+
+var helperProbeCache = struct {
+	sync.Mutex
+	results map[string]helperProbeResult
+}{results: make(map[string]helperProbeResult)}
 
 func (a Android) path() string {
 	if a.ADB != "" {
@@ -62,8 +73,7 @@ func (a Android) Discover(ctx context.Context) ([]Found, error) {
 			capabilities[wire.AppManagement] = true
 		}
 		if a.UseHelper {
-			installed, err := runProcess(ctx, a.path(), "-s", parts[0], "shell", "pm path org.mobileuse.control")
-			capabilities[wire.MultiTouch] = err == nil && bytes.HasPrefix(installed, []byte("package:"))
+			capabilities[wire.MultiTouch] = a.helperSupportsTouchPaths(ctx, parts[0])
 		}
 		devices = append(devices, Found{NativeID: parts[0], Inventory: wire.Inventory{
 			Label: label, Platform: "android", Mode: "adb", Virtual: virtual,
@@ -71,6 +81,45 @@ func (a Android) Discover(ctx context.Context) ([]Found, error) {
 		}})
 	}
 	return devices, nil
+}
+
+func (a Android) helperSupportsTouchPaths(ctx context.Context, id string) bool {
+	key := a.path() + "\x00" + id
+	now := time.Now()
+	helperProbeCache.Lock()
+	if cached, ok := helperProbeCache.results[key]; ok && now.Sub(cached.checkedAt) < time.Minute {
+		helperProbeCache.Unlock()
+		return cached.multiTouch
+	}
+	helperProbeCache.Unlock()
+
+	multiTouch := false
+	installed, err := runProcess(ctx, a.path(), "-s", id, "shell", "pm path org.mobileuse.control")
+	if err == nil && bytes.HasPrefix(installed, []byte("package:")) && ctx.Err() == nil {
+		probe := base64.RawURLEncoding.EncodeToString([]byte(wire.Marshal(map[string]string{"type": "capabilities"})))
+		version, probeErr := runProcess(ctx, a.path(), "-s", id, "shell", "am instrument -w -e request "+probe+" org.mobileuse.control/.ControlInstrumentation")
+		multiTouch = probeErr == nil && bytes.Contains(version, []byte("mobile_use_result=touch_paths_v1"))
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	helperProbeCache.Lock()
+	if len(helperProbeCache.results) >= 256 {
+		for cachedKey, cached := range helperProbeCache.results {
+			if now.Sub(cached.checkedAt) >= time.Minute {
+				delete(helperProbeCache.results, cachedKey)
+			}
+		}
+		if len(helperProbeCache.results) >= 256 {
+			for cachedKey := range helperProbeCache.results {
+				delete(helperProbeCache.results, cachedKey)
+				break
+			}
+		}
+	}
+	helperProbeCache.results[key] = helperProbeResult{checkedAt: now, multiTouch: multiTouch}
+	helperProbeCache.Unlock()
+	return multiTouch
 }
 
 func (a Android) Open(_ context.Context, found Found) (Driver, error) {
@@ -204,7 +253,16 @@ func androidTree(data []byte) ([]wire.Node, error) {
 		if password {
 			label = ""
 		}
-		return wire.Node{Role: values["class"], Label: label, ResourceID: values["resource-id"], Bounds: androidBounds(values["bounds"]), Enabled: values["enabled"] == "true", Clickable: values["clickable"] == "true", Protected: password, Focused: values["focused"] == "true"}, true
+		return wire.Node{
+			Role: values["class"], Label: label, Hint: values["hint"], ResourceID: values["resource-id"],
+			Bounds: androidBounds(values["bounds"]), Enabled: values["enabled"] == "true",
+			Visible: values["visible-to-user"] != "false", VisibilityKnown: true, Clickable: values["clickable"] == "true",
+			LongClickable: values["long-clickable"] == "true", Focusable: values["focusable"] == "true",
+			Editable:  values["editable"] == "true" || strings.HasSuffix(values["class"], "EditText"),
+			Checkable: values["checkable"] == "true", Checked: values["checked"] == "true",
+			Selected: values["selected"] == "true", Scrollable: values["scrollable"] == "true",
+			Protected: password, Focused: values["focused"] == "true",
+		}, true
 	})
 }
 
@@ -239,6 +297,9 @@ func parseNodes(decoder *xml.Decoder, parse func(xml.StartElement) (wire.Node, b
 			node, ok := parse(e)
 			if ok {
 				node.Label = boundedText(node.Label, 256)
+				node.Hint = boundedText(node.Hint, 256)
+				node.Role = boundedText(node.Role, 128)
+				node.ResourceID = boundedText(node.ResourceID, 256)
 				node.ParentID = parent
 				hash := sha256.Sum256([]byte(fmt.Sprintf("%d/%s/%s/%s/%s/%+v", len(result), parent, node.Role, node.Label, node.ResourceID, node.Bounds)))
 				node.ID = hex.EncodeToString(hash[:10])
@@ -280,29 +341,41 @@ func shellQuoted(input string) string { return "'" + strings.ReplaceAll(input, "
 func (a *androidDevice) Action(ctx context.Context, action wire.Action, display Display, rect *wire.Rect) error {
 	var command string
 	switch action.Type {
-	case "tap", "long_press", "swipe", "drag":
-		var x, y int
-		if rect != nil {
-			x, y = rect.X+rect.Width/2, rect.Y+rect.Height/2
-		} else {
-			x, y = Pixel(*action.Point, display)
-		}
-		if x < 0 || y < 0 || x >= display.Width || y >= display.Height {
-			return wire.ErrStale
+	case "tap", "double_tap", "long_press":
+		x, y, err := androidActionStart(action, display, rect)
+		if err != nil {
+			return err
 		}
 		if action.Type == "tap" {
 			command = fmt.Sprintf("input tap %d %d", x, y)
-			break
+		} else if action.Type == "double_tap" {
+			command = fmt.Sprintf("input tap %d %d && sleep 0.08 && input tap %d %d", x, y, x, y)
+		} else {
+			duration := action.DurationMS
+			if duration == 0 {
+				duration = 650
+			}
+			command = fmt.Sprintf("input swipe %d %d %d %d %d", x, y, x, y, duration)
 		}
-		x2, y2 := x, y
-		if action.End != nil {
-			x2, y2 = Pixel(*action.End, display)
+	case "swipe", "drag", "scroll", "fling":
+		paths := action.GesturePaths()
+		if len(paths) == 0 && action.Type == "scroll" && rect != nil {
+			path, err := nodeScrollPath(*rect, display, action.Direction)
+			if err != nil {
+				return err
+			}
+			paths = []wire.TouchPath{path}
 		}
+		if len(paths) != 1 {
+			return wire.ErrUnsupported
+		}
+		x, y := Pixel(paths[0].Start, display)
+		x2, y2 := Pixel(paths[0].End, display)
 		duration := action.DurationMS
 		if duration == 0 {
 			duration = 350
-			if action.Type == "long_press" {
-				duration = 650
+			if action.Type == "fling" {
+				duration = 120
 			}
 		}
 		gesture := "swipe"
@@ -329,18 +402,43 @@ func (a *androidDevice) Action(ctx context.Context, action wire.Action, display 
 			}
 		}
 		command = "input text " + shellQuoted(strings.ReplaceAll(action.Text, " ", "%s"))
-	case "pinch":
+	case "pinch", "rotate", "multi_touch", "two_finger_tap":
 		if !a.helper {
 			return wire.ErrUnsupported
 		}
-		point := func(p *wire.Point) [2]int { x, y := Pixel(*p, display); return [2]int{x, y} }
-		return a.instrument(ctx, map[string]any{"type": "pinch", "starts": [2][2]int{point(action.Point), point(action.SecondPoint)}, "ends": [2][2]int{point(action.End), point(action.SecondEnd)}, "duration_ms": action.DurationMS})
-	case "key":
-		key := map[string]string{"home": "HOME", "back": "BACK", "overview": "APP_SWITCH", "enter": "ENTER", "backspace": "DEL", "volume_up": "VOLUME_UP", "volume_down": "VOLUME_DOWN"}[action.Key]
-		if key == "" {
-			return wire.ErrUnsupported
+		paths := action.GesturePaths()
+		pixels := make([][][2]int, 0, len(paths))
+		for _, path := range paths {
+			x1, y1 := Pixel(path.Start, display)
+			x2, y2 := Pixel(path.End, display)
+			pixels = append(pixels, [][2]int{{x1, y1}, {x2, y2}})
 		}
-		command = "input keyevent KEYCODE_" + key
+		duration := action.DurationMS
+		if duration == 0 {
+			duration = 350
+			if action.Type == "two_finger_tap" {
+				duration = 100
+			}
+		}
+		return a.instrument(ctx, map[string]any{"type": "touches", "paths": pixels, "duration_ms": duration})
+	case "key":
+		switch action.Key {
+		case "notification_shade":
+			command = "cmd statusbar expand-notifications"
+		case "quick_settings":
+			command = "cmd statusbar expand-settings"
+		default:
+			key := map[string]string{
+				"home": "HOME", "back": "BACK", "overview": "APP_SWITCH", "enter": "ENTER", "backspace": "DEL",
+				"tab": "TAB", "escape": "ESCAPE", "menu": "MENU", "dpad_up": "DPAD_UP", "dpad_down": "DPAD_DOWN",
+				"dpad_left": "DPAD_LEFT", "dpad_right": "DPAD_RIGHT", "volume_up": "VOLUME_UP", "volume_down": "VOLUME_DOWN",
+				"volume_mute": "VOLUME_MUTE",
+			}[action.Key]
+			if key == "" {
+				return wire.ErrUnsupported
+			}
+			command = "input keyevent KEYCODE_" + key
+		}
 	default:
 		return wire.ErrUnsupported
 	}
@@ -349,6 +447,30 @@ func (a *androidDevice) Action(ctx context.Context, action wire.Action, display 
 		return wire.ErrUnknown
 	}
 	return nil
+}
+
+func androidActionStart(action wire.Action, display Display, rect *wire.Rect) (int, int, error) {
+	if rect != nil {
+		x, y := rect.X+rect.Width/2, rect.Y+rect.Height/2
+		if x >= 0 && x < display.Width && y >= 0 && y < display.Height {
+			return x, y, nil
+		}
+		return 0, 0, wire.ErrStale
+	}
+	if len(action.Paths) > 0 {
+		x, y := Pixel(action.Paths[0].Start, display)
+		if x >= 0 && x < display.Width && y >= 0 && y < display.Height {
+			return x, y, nil
+		}
+		return 0, 0, wire.ErrStale
+	}
+	if action.Point != nil {
+		x, y := Pixel(*action.Point, display)
+		if x >= 0 && x < display.Width && y >= 0 && y < display.Height {
+			return x, y, nil
+		}
+	}
+	return 0, 0, wire.ErrStale
 }
 
 func (a *androidDevice) instrument(ctx context.Context, payload map[string]any) error {

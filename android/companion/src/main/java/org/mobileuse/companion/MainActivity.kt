@@ -5,8 +5,10 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,6 +64,9 @@ class MainActivity : ComponentActivity() {
     private var attending by mutableStateOf<String?>(null)
     private var busy by mutableStateOf(false)
     private var online by mutableStateOf(false)
+    private var backgroundMonitorEnabled by mutableStateOf(false)
+    private var notificationsAvailable by mutableStateOf(false)
+    private var backgroundNotificationsPending = false
     private var scanningQr by mutableStateOf(false)
     private var pendingQr by mutableStateOf<PairingRequest?>(null)
     private var projectionId: String? = null
@@ -80,6 +85,18 @@ class MainActivity : ComponentActivity() {
         } else { message = "Screen sharing was declined." }
     }
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { requestProjection() }
+    private val backgroundNotificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
+        if (backgroundNotificationsPending) {
+            backgroundNotificationsPending = false
+            if (granted && pairing != null && notificationsAvailable) {
+                setBackgroundConnectionEnabled(true)
+            } else {
+                backgroundMonitorEnabled = false
+                message = "Allow mobile-use notifications in Android Settings to keep approvals available in the background."
+            }
+        }
+    }
     private val cameraScan = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
             message = ""
@@ -120,6 +137,16 @@ class MainActivity : ComponentActivity() {
         store = PairingStore(this)
         lanDiscovery = LanDiscovery(this)
         pairing = store.read()
+        CompanionNotifications.createChannels(this)
+        notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
+        BackgroundConnectionSettings.refresh(this)
+        backgroundMonitorEnabled = BackgroundConnectionSettings.enabled(this)
+        if (backgroundMonitorEnabled && pairing != null && notificationsAvailable) {
+            BackgroundMonitorService.startIfEnabled(this)
+        } else if (backgroundMonitorEnabled) {
+            BackgroundMonitorService.setEnabled(this, false)
+            backgroundMonitorEnabled = false
+        }
         handleDeepLink(intent)
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -174,9 +201,67 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        BackgroundConnectionRuntime.activityVisible = false
         lanDiscovery.stop()
         micJob?.cancel()
         super.onStop()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        BackgroundConnectionRuntime.activityVisible = true
+        CompanionNotifications.clearScreenShareError(this)
+        if (BackgroundConnectionSettings.enabled(this)) CompanionNotifications.clearPending(this)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
+        BackgroundConnectionSettings.refresh(this)
+        backgroundMonitorEnabled = BackgroundConnectionSettings.enabled(this)
+        if (backgroundMonitorEnabled && pairing != null && notificationsAvailable) {
+            BackgroundMonitorService.startIfEnabled(this)
+        } else if (backgroundMonitorEnabled && !notificationsAvailable) {
+            BackgroundMonitorService.setEnabled(this, false)
+            backgroundMonitorEnabled = false
+            message = "Background connection paused because Android notifications are disabled."
+        }
+    }
+
+    private fun setBackgroundConnectionEnabled(enabled: Boolean) {
+        if (!enabled) {
+            BackgroundMonitorService.setEnabled(this, false)
+            backgroundMonitorEnabled = false
+            return
+        }
+        if (pairing == null) {
+            message = "Pair this phone before enabling background connection."
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            backgroundNotificationsPending = true
+            backgroundNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
+        backgroundMonitorEnabled = BackgroundMonitorService.setEnabled(this, true)
+        if (!backgroundMonitorEnabled) {
+            message = "Background connection could not start. Allow notifications and check Android battery settings."
+        } else {
+            message = "Background connection is on. Android will show an ongoing notification."
+        }
+    }
+
+    private fun openBatterySettings() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(Uri.parse("package:$packageName")))
+        }.onFailure { message = "Open Android Settings and find mobile-use under Apps to change its battery use." }
+    }
+
+    private fun openNotificationSettings() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        }.onFailure { message = "Open Android Settings and allow notifications for mobile-use." }
     }
 
     private fun handleDeepLink(intent: Intent?) {
@@ -288,6 +373,7 @@ class MainActivity : ComponentActivity() {
         ScreenShareService.stop(this)
         Sharing.error.value = null
         Sharing.lastFrameAt.value = null
+        CompanionNotifications.clearScreenShareError(this)
         lifecycleScope.launch {
             try {
                 withContext(Dispatchers.IO) { CompanionApi(current).session(id, "end") }
@@ -336,6 +422,7 @@ class MainActivity : ComponentActivity() {
         val sharing by Sharing.session.collectAsState()
         val sharingError by Sharing.error.collectAsState()
         val lastFrameAt by Sharing.lastFrameAt.collectAsState()
+        val backgroundConnectionOn by BackgroundConnectionSettings.state.collectAsState()
         val discoveredHosts by lanDiscovery.hosts.collectAsState()
         var origin by rememberSaveable { mutableStateOf("") }
         var code by remember { mutableStateOf("") }
@@ -646,6 +733,40 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+                        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text("Background connection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            if (backgroundConnectionOn) "On · approvals and alerts stay available while you leave the app."
+                                            else "Off · this phone checks for requests while the app is open.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = colors.onSurfaceVariant,
+                                        )
+                                    }
+                                    Switch(
+                                        checked = backgroundConnectionOn,
+                                        onCheckedChange = ::setBackgroundConnectionEnabled,
+                                    )
+                                }
+                                Text(
+                                    "When on, mobile-use uses network and may use battery, and Android keeps an ongoing notification. For better screen-off reliability, open app info and set battery use to Unrestricted where available. Android may still defer network access. Screen sharing needs a fresh capture approval, and a locked or powered-off screen may produce blank frames.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    TextButton(onClick = ::openBatterySettings) { Text("Open app info") }
+                                    if (!notificationsAvailable) {
+                                        TextButton(onClick = ::openNotificationSettings) { Text("Notification settings") }
+                                    }
+                                }
+                            }
+                        }
                         status.sessions.forEach { item ->
                             OutlinedCard(Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -702,6 +823,8 @@ class MainActivity : ComponentActivity() {
                 title = { Text("Unpair this phone?") }, text = { Text("Sharing stops and this phone will need a new pairing code.") },
                 confirmButton = { TextButton(onClick = {
                     ScreenShareService.stop(this@MainActivity)
+                    BackgroundMonitorService.setEnabled(this@MainActivity, false)
+                    backgroundMonitorEnabled = false
                     val previous = pairing
                     store.clear(); pairing = null; attending = null
                     online = false

@@ -7,11 +7,16 @@ import java.net.URL
 import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.X509TrustManager
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,6 +27,18 @@ class ApiFailure(val status: Int, message: String) : IOException(message)
 
 class CompanionApi(private val pairing: Pairing) {
     private val pinnedSsl = pairing.certPin.takeIf { it.isNotEmpty() }?.let(::buildPinnedSsl)
+    private val frameClient = OkHttpClient.Builder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .writeTimeout(4, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
+        .apply {
+            pinnedSsl?.let { pin ->
+                sslSocketFactory(pin.context.socketFactory, pin.trustManager)
+                hostnameVerifier(pin.hostnameVerifier)
+            }
+        }
+        .build()
 
     fun heartbeat(present: String?): Heartbeat {
         val result = json("/companion/heartbeat", JSONObject().put("present_session", present.orEmpty()))
@@ -39,7 +56,29 @@ class CompanionApi(private val pairing: Pairing) {
     fun session(id: String, action: String) { json("/companion/sessions/${safeId(id)}/$action", JSONObject()) }
     fun denySensor(id: String) { json("/companion/sensors/${safeId(id)}/deny", JSONObject()) }
     fun upload(id: String, bytes: ByteArray, mime: String) { post("/companion/sensors/${safeId(id)}/artifact", mime, bytes) }
-    fun frame(id: String, bytes: ByteArray) { post("/companion/sessions/${safeId(id)}/frame", "image/jpeg", bytes) }
+    fun frame(id: String, bytes: ByteArray) {
+        val request = Request.Builder()
+            .url(pairing.origin.trimEnd('/') + "/companion/sessions/${safeId(id)}/frame")
+            .header("Content-Type", "image/jpeg")
+            .apply { if (pairing.token.isNotEmpty()) header("Authorization", "Bearer ${pairing.token}") }
+            .post(bytes.toRequestBody("image/jpeg".toMediaType()))
+            .build()
+        try {
+            frameClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val body = response.body?.string()?.take(128 * 1024).orEmpty()
+                    val message = runCatching { JSONObject(body).getJSONObject("error").getString("message") }.getOrNull()
+                    throw ApiFailure(response.code, message ?: "The server rejected the request (${response.code}).")
+                }
+            }
+        } catch (error: SSLHandshakeException) {
+            throw ApiFailure(0, "Certificate check failed. Scan a fresh QR code or verify your HTTPS certificate.")
+        } catch (error: java.net.ConnectException) {
+            throw ApiFailure(0, "Could not reach ${pairing.origin}. Confirm both devices are on the same Wi-Fi.")
+        } catch (error: java.net.SocketTimeoutException) {
+            throw ApiFailure(0, "The screen upload timed out reaching ${pairing.origin}. Check Wi-Fi and firewall rules.")
+        }
+    }
     fun unpair() { json("/companion/unpair", JSONObject()) }
 
     private fun json(path: String, value: JSONObject): JSONObject =
@@ -49,8 +88,8 @@ class CompanionApi(private val pairing: Pairing) {
         val connection = URL(pairing.origin + path).openConnection() as HttpsURLConnection
         try {
             if (pinnedSsl != null) {
-                connection.sslSocketFactory = pinnedSsl.first.socketFactory
-                connection.hostnameVerifier = pinnedSsl.second
+                connection.sslSocketFactory = pinnedSsl.context.socketFactory
+                connection.hostnameVerifier = pinnedSsl.hostnameVerifier
             }
             connection.requestMethod = "POST"
             connection.instanceFollowRedirects = false
@@ -106,7 +145,13 @@ class CompanionApi(private val pairing: Pairing) {
     }
 }
 
-private fun buildPinnedSsl(hexPin: String): Pair<SSLContext, HostnameVerifier> {
+internal data class PinnedSsl(
+    val context: SSLContext,
+    val hostnameVerifier: HostnameVerifier,
+    val trustManager: X509TrustManager,
+)
+
+internal fun buildPinnedSsl(hexPin: String): PinnedSsl {
     val expected = hexToBytes(hexPin)
     val trustManager = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
@@ -132,7 +177,7 @@ private fun buildPinnedSsl(hexPin: String): Pair<SSLContext, HostnameVerifier> {
         val digest = MessageDigest.getInstance("SHA-256").digest(leaf.encoded)
         MessageDigest.isEqual(digest, expected)
     }
-    return context to verifier
+    return PinnedSsl(context, verifier, trustManager)
 }
 
 private fun hexToBytes(hex: String): ByteArray {

@@ -218,6 +218,42 @@ components:
       properties:
         x: {type: number, minimum: 0, exclusiveMaximum: 1}
         y: {type: number, minimum: 0, exclusiveMaximum: 1}
+    TouchPath:
+      type: object
+      required: [start, end]
+      properties:
+        start: {$ref: '#/components/schemas/Point'}
+        end: {$ref: '#/components/schemas/Point'}
+    UINode:
+      type: object
+      required: [id, bounds, enabled, visible, clickable]
+      properties:
+        id: {type: string}
+        parent_id: {type: string}
+        role: {type: string}
+        label: {type: string}
+        hint: {type: string}
+        resource_id: {type: string}
+        bounds:
+          type: object
+          required: [x, y, width, height]
+          properties:
+            x: {type: integer}
+            y: {type: integer}
+            width: {type: integer, minimum: 0}
+            height: {type: integer, minimum: 0}
+        enabled: {type: boolean}
+        visible: {type: boolean}
+        clickable: {type: boolean}
+        long_clickable: {type: boolean}
+        focusable: {type: boolean}
+        editable: {type: boolean}
+        checkable: {type: boolean}
+        checked: {type: boolean}
+        selected: {type: boolean}
+        scrollable: {type: boolean}
+        protected: {type: boolean}
+        focused: {type: boolean}
     Operation:
       type: object
       required: [kind]
@@ -242,16 +278,22 @@ components:
           type: object
           required: [type, frame_id]
           properties:
-            type: {enum: [tap, long_press, swipe, drag, pinch, type, key]}
+            type: {enum: [tap, double_tap, long_press, swipe, drag, scroll, fling, pinch, rotate, two_finger_tap, multi_touch, type, key]}
             frame_id: {type: string}
             node_id: {type: string}
             point: {$ref: '#/components/schemas/Point'}
             end: {$ref: '#/components/schemas/Point'}
             second_point: {$ref: '#/components/schemas/Point'}
             second_end: {$ref: '#/components/schemas/Point'}
+            paths:
+              type: array
+              minItems: 1
+              maxItems: 5
+              items: {$ref: '#/components/schemas/TouchPath'}
+            direction: {enum: [up, down, left, right]}
             duration_ms: {type: integer, minimum: 0, maximum: 3000}
             text: {type: string}
-            key: {enum: [home, back, overview, enter, backspace, volume_up, volume_down]}
+            key: {enum: [home, back, overview, enter, backspace, tab, escape, menu, dpad_up, dpad_down, dpad_left, dpad_right, volume_up, volume_down, volume_mute, notification_shade, quick_settings]}
         browser:
           type: object
           required: [context_id]
@@ -276,7 +318,18 @@ components:
       properties:
         id: {type: string}
         state: {enum: [succeeded, failed, executing, outcome_unknown]}
-        observation: {type: object}
+        observation:
+          type: object
+          properties:
+            frame_id: {type: string}
+            captured_at: {type: string, format: date-time}
+            width: {type: integer, minimum: 1}
+            height: {type: integer, minimum: 1}
+            orientation: {type: string}
+            app_id: {type: string}
+            image: {type: object}
+            nodes: {type: array, items: {$ref: '#/components/schemas/UINode'}}
+            partial: {type: array, items: {type: string}}
         apps: {type: array, items: {type: string}}
         contexts: {type: array, items: {type: object}}
         page: {type: object}

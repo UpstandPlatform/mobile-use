@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS devices (
     enabled INTEGER NOT NULL DEFAULT 0,
     online_until BIGINT NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
-    active_session TEXT NOT NULL DEFAULT ''
+    active_session TEXT NOT NULL DEFAULT '',
+    removed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS devices_workspace ON devices(workspace, connector);
 

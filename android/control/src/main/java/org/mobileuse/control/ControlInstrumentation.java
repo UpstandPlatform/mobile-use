@@ -34,7 +34,9 @@ public final class ControlInstrumentation extends Instrumentation {
             JSONObject request = new JSONObject(new String(Base64.decode(encoded, BASE64_FLAGS), StandardCharsets.UTF_8));
             UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
             result = switch (request.getString("type")) {
+                case "capabilities" -> "touch_paths_v1";
                 case "type" -> type(automation, request.getString("text"), request.getString("app_id"));
+                case "touches" -> touches(automation, request);
                 case "pinch" -> pinch(automation, request);
                 default -> "unsupported";
             };
@@ -128,6 +130,66 @@ public final class ControlInstrumentation extends Instrumentation {
         } finally {
             if (!finished) event(automation, down, MotionEvent.ACTION_CANCEL, 2, end);
         }
+    }
+
+    private static String touches(UiAutomation automation, JSONObject request) throws JSONException {
+        JSONArray paths = request.getJSONArray("paths");
+        int count = paths.length();
+        if (count < 2 || count > 5) return "unsupported";
+        float[][] starts = new float[count][2];
+        float[][] ends = new float[count][2];
+        for (int finger = 0; finger < count; finger++) {
+            JSONArray path = paths.getJSONArray(finger);
+            if (path.length() != 2) throw new IllegalArgumentException("Invalid touch path");
+            for (int axis = 0; axis < 2; axis++) {
+                double start = path.getJSONArray(0).getDouble(axis);
+                double end = path.getJSONArray(1).getDouble(axis);
+                if (!Double.isFinite(start) || !Double.isFinite(end) || start < 0 || end < 0 || start > 10000 || end > 10000) {
+                    throw new IllegalArgumentException("Invalid touch coordinates");
+                }
+                starts[finger][axis] = (float) start;
+                ends[finger][axis] = (float) end;
+            }
+        }
+        int duration = Math.min(3000, Math.max(80, request.optInt("duration_ms", 350)));
+        long down = SystemClock.uptimeMillis();
+        int activePointers = 0;
+        boolean finished = false;
+        try {
+            if (!event(automation, down, MotionEvent.ACTION_DOWN, 1, starts)) return "unknown";
+            activePointers = 1;
+            for (int finger = 1; finger < count; finger++) {
+                int action = MotionEvent.ACTION_POINTER_DOWN | (finger << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                if (!event(automation, down, action, finger + 1, starts)) return "unknown";
+                activePointers++;
+            }
+            for (int elapsed = 0; elapsed < duration; elapsed += 16) {
+                float fraction = (float) elapsed / duration;
+                float[][] intermediate = interpolate(starts, ends, fraction);
+                if (!event(automation, down, MotionEvent.ACTION_MOVE, activePointers, intermediate)) return "unknown";
+                SystemClock.sleep(16);
+            }
+            if (!event(automation, down, MotionEvent.ACTION_MOVE, activePointers, ends)) return "unknown";
+            for (int finger = count - 1; finger > 0; finger--) {
+                int action = MotionEvent.ACTION_POINTER_UP | (finger << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                if (!event(automation, down, action, activePointers, ends)) return "unknown";
+                activePointers--;
+            }
+            finished = event(automation, down, MotionEvent.ACTION_UP, 1, ends);
+            return finished ? "ok" : "unknown";
+        } finally {
+            if (!finished && activePointers > 0) event(automation, down, MotionEvent.ACTION_CANCEL, activePointers, ends);
+        }
+    }
+
+    private static float[][] interpolate(float[][] starts, float[][] ends, float fraction) {
+        float[][] result = new float[starts.length][2];
+        for (int finger = 0; finger < starts.length; finger++) {
+            for (int axis = 0; axis < 2; axis++) {
+                result[finger][axis] = starts[finger][axis] + fraction * (ends[finger][axis] - starts[finger][axis]);
+            }
+        }
+        return result;
     }
 
     private static float[][] positions(JSONArray values) throws JSONException {

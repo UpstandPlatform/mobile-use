@@ -43,19 +43,42 @@ type Companion interface {
 	Stop(store.Target)
 }
 
+// disconnectedMessage marks a Forward rejection issued before anything was sent
+// to the connector, so the caller can report DEVICE_OFFLINE instead of an unknown outcome.
+const disconnectedMessage = "Connector is disconnected"
+
+// errConnectionClosed is returned by connection.send once Connect has returned:
+// gRPC forbids SendMsg on a server stream after its handler exits.
+var errConnectionClosed = errors.New("connector stream closed")
+
+// connection is one connector's Connect stream. sendClosed is guarded by
+// sendMutex, so no SendMsg can be in flight or start once shutdown returns.
 type connection struct {
-	stream    Stream
-	sendMutex sync.Mutex
-	mu        sync.Mutex
-	pending   map[string]chan wire.Result
-	viewers   map[string]*videoWatch
-	closed    chan struct{}
+	stream     Stream
+	sendMutex  sync.Mutex
+	sendClosed bool
+	mu         sync.Mutex
+	pending    map[string]chan wire.Result
+	viewers    map[string]*videoWatch
+	closed     chan struct{}
 }
 
 func (c *connection) send(message Message) error {
 	c.sendMutex.Lock()
 	defer c.sendMutex.Unlock()
+	if c.sendClosed {
+		return errConnectionClosed
+	}
 	return send(c.stream, message)
+}
+
+// shutdown stops all further sends, waiting for an in-flight SendMsg, and
+// wakes everything waiting on the connection. Connect calls it before returning.
+func (c *connection) shutdown() {
+	c.sendMutex.Lock()
+	c.sendClosed = true
+	c.sendMutex.Unlock()
+	close(c.closed)
 }
 
 func (c *connection) execute(ctx context.Context, command wire.Dispatch) (wire.Result, error) {
@@ -73,6 +96,10 @@ func (c *connection) execute(ctx context.Context, command wire.Dispatch) (wire.R
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
 	if err := c.send(Message{Type: "execute", Command: &command}); err != nil {
+		if errors.Is(err, errConnectionClosed) {
+			// Nothing reached the connector.
+			return wire.Result{}, wire.ErrOffline
+		}
 		return wire.Result{}, wire.ErrUnknown
 	}
 	select {
@@ -147,7 +174,7 @@ func (h *Hub) Connect(stream grpc.ServerStream) error {
 	h.connections[key] = conn
 	h.mu.Unlock()
 	defer func() {
-		close(conn.closed)
+		conn.shutdown()
 		h.mu.Lock()
 		if h.connections[key] == conn {
 			delete(h.connections, key)
@@ -265,7 +292,7 @@ func (h *Hub) Forward(ctx context.Context, request *wrapperspb.BytesValue) (*wra
 	}
 	conn := h.conn(*message.Target)
 	if conn == nil {
-		return nil, status.Error(codes.Unavailable, "Connector is disconnected")
+		return nil, status.Error(codes.Unavailable, disconnectedMessage)
 	}
 	switch message.Type {
 	case "execute":
@@ -276,6 +303,9 @@ func (h *Hub) Forward(ctx context.Context, request *wrapperspb.BytesValue) (*wra
 			return nil, status.Error(codes.FailedPrecondition, "Session is inactive")
 		}
 		result, err := conn.execute(ctx, *message.Command)
+		if errors.Is(err, wire.ErrOffline) {
+			return nil, status.Error(codes.Unavailable, disconnectedMessage)
+		}
 		if err != nil {
 			return nil, status.Error(codes.Aborted, "Device outcome is unknown")
 		}
@@ -311,12 +341,24 @@ func (h *Hub) forward(ctx context.Context, target store.Target, message Message)
 	defer conn.Close()
 	var response wrapperspb.BytesValue
 	if err := conn.Invoke(ctx, forwardMethod, packet(message), &response); err != nil {
-		if status.Code(err) == codes.FailedPrecondition {
-			return Message{}, wire.ErrExpired
-		}
-		return Message{}, wire.ErrUnknown
+		return Message{}, forwardError(err)
 	}
 	return unpack(&response)
+}
+
+// forwardError maps a peer replica's Forward failure to a public fault. Only the
+// peer's explicit "disconnected" rejection proves nothing ran; other Unavailable
+// errors (transport failures) may arrive after the connector acted.
+func forwardError(err error) error {
+	reply := status.Convert(err)
+	switch {
+	case reply.Code() == codes.FailedPrecondition:
+		return wire.ErrExpired
+	case reply.Code() == codes.Unavailable && reply.Message() == disconnectedMessage:
+		return wire.ErrOffline
+	default:
+		return wire.ErrUnknown
+	}
 }
 
 func (h *Hub) Serve(ctx context.Context, listen string, config *tls.Config) error {

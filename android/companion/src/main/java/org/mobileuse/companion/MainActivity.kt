@@ -46,6 +46,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private companion object {
+        const val STATE_PROJECTION = "pending.projection"
+        const val STATE_PHOTO_FILE = "pending.photo.file"
+        const val STATE_PHOTO_REQUEST = "pending.photo.request"
+        const val STATE_MIC_REQUEST = "pending.mic.request"
+    }
+
     private lateinit var store: PairingStore
     private lateinit var lanDiscovery: LanDiscovery
     private var pairing by mutableStateOf<Pairing?>(null)
@@ -83,7 +90,7 @@ class MainActivity : ComponentActivity() {
     private val microphone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         val request = micRequest ?: return@registerForActivityResult
         micRequest = null
-        if (granted) record(request) else execute { it.denySensor(request.id) }
+        if (!granted || !record(request)) resolveSensor { it.denySensor(request.id) }
     }
     private val cameraCapturePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         val request = photoRequest ?: return@registerForActivityResult
@@ -95,16 +102,16 @@ class MainActivity : ComponentActivity() {
         val file = photoFile
         photoRequest = null
         photoFile = null
-        if (request == null || file == null) return@registerForActivityResult
-        execute {
-            try {
-                if (approved) it.upload(request.id, approvedPhoto(file), "image/jpeg") else it.denySensor(request.id)
-            } finally { file.delete() }
+        if (request == null) { file?.delete(); return@registerForActivityResult }
+        if (file == null) { resolveSensor { it.denySensor(request.id) }; return@registerForActivityResult }
+        resolveSensor(cleanup = { file.delete() }) {
+            if (approved) it.upload(request.id, approvedPhoto(file), "image/jpeg") else it.denySensor(request.id)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        savedInstanceState?.let { restorePending(it) }
         WindowCompat.getInsetsController(window, window.decorView).apply {
             isAppearanceLightStatusBars = true
             isAppearanceLightNavigationBars = true
@@ -137,6 +144,28 @@ class MainActivity : ComponentActivity() {
         }
         setContent { CompanionUI() }
     }
+
+    // The system may recreate this Activity while the camera, permission or screen-capture
+    // screen is in front; keep what their results need to finish the pending request.
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_PROJECTION, projectionId)
+        outState.putString(STATE_PHOTO_FILE, photoFile?.absolutePath)
+        photoRequest?.let { outState.putStringArray(STATE_PHOTO_REQUEST, encodeSensor(it)) }
+        micRequest?.let { outState.putStringArray(STATE_MIC_REQUEST, encodeSensor(it)) }
+    }
+
+    private fun restorePending(state: Bundle) {
+        projectionId = state.getString(STATE_PROJECTION)
+        photoFile = state.getString(STATE_PHOTO_FILE)?.let { File(it) }
+        photoRequest = state.getStringArray(STATE_PHOTO_REQUEST)?.let { decodeSensor(it) }
+        micRequest = state.getStringArray(STATE_MIC_REQUEST)?.let { decodeSensor(it) }
+    }
+
+    private fun encodeSensor(request: SensorRequest) = arrayOf(request.id, request.sessionId, request.type, request.seconds.toString())
+
+    private fun decodeSensor(values: Array<String>): SensorRequest? =
+        if (values.size == 4) values[3].toIntOrNull()?.let { SensorRequest(values[0], values[1], values[2], it) } else null
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -188,9 +217,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun record(request: SensorRequest) {
-        val current = pairing ?: return
-        if (busy) return
+    /**
+     * Resolves a sensor request from an activity result. Unlike [execute] it never drops the
+     * work because another request is busy, so the server is not left waiting, and [cleanup]
+     * always runs (also when the phone was unpaired meanwhile).
+     */
+    private fun resolveSensor(cleanup: () -> Unit = {}, task: suspend (CompanionApi) -> Unit) {
+        val current = pairing
+        if (current == null) { cleanup(); return }
+        lifecycleScope.launch {
+            try { withContext(Dispatchers.IO) { task(CompanionApi(current)) } }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { message = if (error is ApiFailure) error.message.orEmpty() else "The request could not be completed." }
+            finally { cleanup() }
+        }
+    }
+
+    /** Returns false when the clip could not start, so the caller can resolve the request. */
+    private fun record(request: SensorRequest): Boolean {
+        val current = pairing ?: return false
+        if (busy) return false
         busy = true
         message = "Recording microphone clip…"
         micJob = lifecycleScope.launch {
@@ -201,6 +247,7 @@ class MainActivity : ComponentActivity() {
             catch (_: Exception) { message = "The microphone clip could not be sent." }
             finally { busy = false }
         }
+        return true
     }
 
     private fun takePhoto(request: SensorRequest) {
@@ -225,7 +272,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun denySensorWithNotice(requestId: String, notice: String) {
-        execute {
+        resolveSensor {
             it.denySensor(requestId)
             withContext(Dispatchers.Main) { message = notice }
         }

@@ -100,6 +100,9 @@ func (c *connection) watch(parent context.Context, target store.Target, publish 
 		_ = c.send(Message{Type: "video_stop", VideoID: id})
 	}()
 	if err := c.send(Message{Type: "video_start", VideoID: id, Target: &target}); err != nil {
+		if errors.Is(err, errConnectionClosed) {
+			return wire.ErrOffline
+		}
 		return err
 	}
 	ticker := time.NewTicker(2500 * time.Millisecond)
@@ -137,7 +140,7 @@ func (h *Hub) PublishVideo(stream grpc.ServerStream) error {
 	}
 	conn := h.conn(store.Target{Workspace: workspace, Connector: name})
 	if conn == nil {
-		return status.Error(codes.Unavailable, "Connector is disconnected")
+		return status.Error(codes.Unavailable, disconnectedMessage)
 	}
 	conn.mu.Lock()
 	watch := conn.viewers[opening.VideoID]
@@ -189,7 +192,7 @@ func (h *Hub) WatchVideo(stream grpc.ServerStream) error {
 	}
 	conn := h.conn(target)
 	if conn == nil {
-		return status.Error(codes.Unavailable, "Connector is disconnected")
+		return status.Error(codes.Unavailable, disconnectedMessage)
 	}
 	return conn.watch(ctx, target, func(frame wire.VideoFrame) error { return send(stream, Message{Type: "frame", Frame: &frame}) })
 }

@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS companions (
     device TEXT NOT NULL UNIQUE,
     workspace TEXT NOT NULL,
     owner TEXT NOT NULL,
-    label TEXT NOT NULL
+    label TEXT NOT NULL,
+    control_device TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS mobile_use_schema_migrations (

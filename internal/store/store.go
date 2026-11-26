@@ -21,7 +21,7 @@ import (
 var schema string
 
 const (
-	schemaVersion  = 3
+	schemaVersion  = 4
 	ConnectorTTL   = 10 * time.Second
 	PresenceTTL    = 15 * time.Second
 	IdleTimeout    = 5 * time.Minute
@@ -131,9 +131,57 @@ func (s *Store) migrate(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), 3); err != nil {
 				return err
 			}
+			current = 3
+		}
+		if current < 4 {
+			if err := s.ensureCompanionControlDeviceColumn(ctx, tx); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS companions_control_device_unique ON companions(workspace, control_device) WHERE control_device <> ''"); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, s.query("INSERT INTO mobile_use_schema_migrations(version) VALUES (?) ON CONFLICT DO NOTHING"), 4); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+}
+
+func (s *Store) ensureCompanionControlDeviceColumn(ctx context.Context, tx *sql.Tx) error {
+	if s.postgres {
+		_, err := tx.ExecContext(ctx, "ALTER TABLE companions ADD COLUMN IF NOT EXISTS control_device TEXT NOT NULL DEFAULT ''")
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(companions)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "control_device" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, "ALTER TABLE companions ADD COLUMN control_device TEXT NOT NULL DEFAULT ''")
+	return err
 }
 
 func (s *Store) currentSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
@@ -578,6 +626,9 @@ func (s *Store) RemoveDevice(ctx context.Context, actor wire.Actor, id string, n
 			}
 		}
 		if _, err := tx.ExecContext(ctx, s.query("DELETE FROM companions WHERE workspace = ? AND device = ?"), actor.Workspace, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.query("UPDATE companions SET control_device = '' WHERE workspace = ? AND control_device = ?"), actor.Workspace, id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, s.query("UPDATE devices SET enabled = 0, online_until = 0, removed = 1 WHERE workspace = ? AND id = ?"), actor.Workspace, id); err != nil {

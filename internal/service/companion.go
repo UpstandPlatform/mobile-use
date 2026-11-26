@@ -41,11 +41,14 @@ type Companion struct {
 	Mode            string
 	HostName        string
 
-	mu        sync.Mutex
-	frames    map[string]phoneFrame
-	frameSubs map[string]map[chan frameEvent]struct{}
-	requests  map[string]sensorEntry
-	attempts  map[string][]time.Time
+	mu             sync.Mutex
+	frames         map[string]phoneFrame
+	frameSubs      map[string]map[chan frameEvent]struct{}
+	gestureSubs    map[string]map[chan gestureEvent]gestureSubscriber
+	gestureEnabled map[string]bool
+	media          map[companionMediaKey]*companionMediaFeed
+	requests       map[string]sensorEntry
+	attempts       map[string][]time.Time
 }
 
 type phoneFrame struct {
@@ -75,6 +78,8 @@ func NewCompanion(db *store.Store, origin string) *Companion {
 		Mode:           "remote",
 		frames:         make(map[string]phoneFrame),
 		frameSubs:      make(map[string]map[chan frameEvent]struct{}),
+		gestureSubs:    make(map[string]map[chan gestureEvent]gestureSubscriber),
+		gestureEnabled: make(map[string]bool),
 		requests:       make(map[string]sensorEntry),
 		attempts:       make(map[string][]time.Time),
 	}
@@ -167,6 +172,7 @@ func (c *Companion) selectOrigin(requested string) (string, bool) {
 }
 
 func (c *Companion) ConsoleRoutes(router *http.ServeMux, auth *Auth, origin string) {
+	c.GestureConsoleRoutes(router, auth, origin)
 	router.Handle("GET /v1/companion/sessions/{id}/frames", auth.Require(withActor(c.streamFrames), origin))
 	router.Handle("POST /v1/companion/pairing", auth.Require(withActor(func(w http.ResponseWriter, r *http.Request, actor wire.Actor) {
 		var req struct {
@@ -389,7 +395,8 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 		now := time.Now()
 		caps := wire.Capabilities{wire.Screen: true, wire.Camera: true, wire.Microphone: true}
 		id := phoneConnector(phone.ID)
-		if err := c.Store.Register(ctx, phone.Workspace, id, []wire.Inventory{{ID: phone.ID, Label: phone.Label, Platform: "android", Mode: "companion", Capabilities: caps}}, now); err != nil {
+		liveVideo := r.Header.Get("X-Mobile-Use-Media") == "1"
+		if err := c.Store.Register(ctx, phone.Workspace, id, []wire.Inventory{{ID: phone.ID, Label: phone.Label, Platform: "android", Mode: "companion", Capabilities: caps, LiveVideo: liveVideo}}, now); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -420,6 +427,19 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 		c.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"sessions": visible, "sensors": requests})
 	}))
+	router.HandleFunc("POST /companion/gesture-pointer", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
+		var req struct {
+			Enabled bool `json:"enabled"`
+		}
+		if !readJSON(w, r, &req) {
+			return
+		}
+		c.mu.Lock()
+		c.ensureMapsLocked()
+		c.gestureEnabled[phone.ID] = req.Enabled
+		c.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]bool{"enabled": req.Enabled})
+	}))
 	router.HandleFunc("POST /companion/unpair", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
 		if err := c.Store.RevokeCompanion(r.Context(), ownerActor(phone), phone.ID); err != nil {
 			writeError(w, err)
@@ -447,6 +467,8 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 	}))
 	router.HandleFunc("POST /companion/sessions/{id}/frame", c.phone(c.uploadFrame))
 	router.HandleFunc("GET /companion/sessions/{id}/frames", c.phone(c.streamPhoneFrames))
+	router.HandleFunc("GET /companion/sessions/{id}/media/{source}", c.phone(c.streamPhoneMedia))
+	c.GesturePhoneRoutes(router)
 	router.HandleFunc("POST /companion/sensors/{id}/deny", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
 		entry, err := c.sensorFor(phone, r.PathValue("id"))
 		if err != nil {
@@ -479,6 +501,12 @@ func (c *Companion) ensureMapsLocked() {
 	}
 	if c.frameSubs == nil {
 		c.frameSubs = make(map[string]map[chan frameEvent]struct{})
+	}
+	if c.gestureSubs == nil {
+		c.gestureSubs = make(map[string]map[chan gestureEvent]gestureSubscriber)
+	}
+	if c.gestureEnabled == nil {
+		c.gestureEnabled = make(map[string]bool)
 	}
 	if c.requests == nil {
 		c.requests = make(map[string]sensorEntry)
@@ -910,6 +938,11 @@ func (c *Companion) Dispatch(_ context.Context, target store.Target, command wir
 func (c *Companion) Stop(target store.Target) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.ensureMapsLocked()
+	c.stopMediaLocked(target)
+	if target.Session == "" {
+		delete(c.gestureEnabled, target.Device)
+	}
 	if frame := c.frames[target.Device]; target.Session == "" || frame.session == target.Session {
 		delete(c.frames, target.Device)
 		c.publishEventLocked(target.Device, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})

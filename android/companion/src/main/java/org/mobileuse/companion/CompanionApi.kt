@@ -41,7 +41,8 @@ class CompanionApi(private val pairing: Pairing) {
         .build()
 
     fun heartbeat(present: String?): Heartbeat {
-        val result = json("/companion/heartbeat", JSONObject().put("present_session", present.orEmpty()))
+        val data = JSONObject().put("present_session", present.orEmpty()).toString().toByteArray()
+        val result = JSONObject(post("/companion/heartbeat", "application/json", data, advertiseMedia = true))
         val sessions = result.optJSONArray("sessions").objects().map {
             val caps = it.optJSONArray("capabilities") ?: JSONArray()
             PhoneSession(it.getString("id"), it.getString("purpose"), it.getString("requester"), it.getString("state"),
@@ -51,6 +52,10 @@ class CompanionApi(private val pairing: Pairing) {
             SensorRequest(it.getString("id"), it.getString("session_id"), it.getString("type"), it.optInt("duration_seconds", 5))
         }
         return Heartbeat(sessions, sensors)
+    }
+
+    fun gesturePointer(enabled: Boolean) {
+        json("/companion/gesture-pointer", JSONObject().put("enabled", enabled))
     }
 
     fun session(id: String, action: String) { json("/companion/sessions/${safeId(id)}/$action", JSONObject()) }
@@ -84,7 +89,7 @@ class CompanionApi(private val pairing: Pairing) {
     private fun json(path: String, value: JSONObject): JSONObject =
         JSONObject(post(path, "application/json", value.toString().toByteArray()))
 
-    private fun post(path: String, mime: String, data: ByteArray): String {
+    private fun post(path: String, mime: String, data: ByteArray, advertiseMedia: Boolean = false): String {
         val connection = URL(pairing.origin + path).openConnection() as HttpsURLConnection
         try {
             if (pinnedSsl != null) {
@@ -96,6 +101,7 @@ class CompanionApi(private val pairing: Pairing) {
             connection.connectTimeout = 4000
             connection.readTimeout = 6000
             connection.setRequestProperty("Content-Type", mime)
+            if (advertiseMedia) connection.setRequestProperty("X-Mobile-Use-Media", "1")
             if (pairing.token.isNotEmpty()) connection.setRequestProperty("Authorization", "Bearer ${pairing.token}")
             connection.doOutput = true
             connection.setFixedLengthStreamingMode(data.size)

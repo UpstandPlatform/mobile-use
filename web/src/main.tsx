@@ -19,7 +19,7 @@ import { toast } from 'sonner';
 import { api, ApiError, beginLogin, completeLogin, exchangeLaunchTicket, labels } from './api';
 import type { Actor, Audit, AuditPage, Device, Grant, Observation, OIDC, Session, SystemInfo } from './api';
 import { AddDevicePanel } from './AddDevicePanel';
-import { LiveVideo } from './LiveVideo';
+import { CompanionSensors, LiveVideo, MediaVideo, useLiveMedia } from './LiveVideo';
 import { consolePath, readConsoleRoute } from './routes';
 const McpSetup = lazy(() => import('./McpSetup').then((module) => ({ default: module.McpSetup })));
 import { AppSidebar } from './AppSidebar';
@@ -709,6 +709,15 @@ function App() {
                               ))}
                           </div>
                           <Separator />
+                          {device.mode === 'companion' && device.platform === 'android' && canRemoveDevice && (
+                            <GestureTargetSettings
+                              key={`gesture-target-${device.id}`}
+                              device={device}
+                              devices={devices}
+                              token={token}
+                              onError={setError}
+                            />
+                          )}
                           {deviceSessions.length > 0 && (
                             <SessionList
                               sessions={deviceSessions}
@@ -1288,6 +1297,104 @@ function SessionList({
         );
       })}
     </div>
+  );
+}
+
+function GestureTargetSettings({
+  device,
+  devices,
+  token,
+  onError,
+}: {
+  device: Device;
+  devices: Device[];
+  token: string;
+  onError: (message: string) => void;
+}) {
+  const [targetId, setTargetId] = useState('');
+  const [choice, setChoice] = useState('none');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const targets = devices.filter(
+    (item) => item.id !== device.id && item.platform === 'android' && item.mode === 'adb' &&
+      item.enabled && item.owner === device.owner,
+  );
+
+  useEffect(() => {
+    let current = true;
+    setLoading(true);
+    api<{ target_device_id: string }>(
+      token,
+      `/v1/companion/gesture-target/${encodeURIComponent(device.id)}`,
+    ).then((result) => {
+      if (!current) return;
+      const value = result.target_device_id || '';
+      setTargetId(value);
+      setChoice(value || 'none');
+    }).catch((reason: unknown) => {
+      if (current) onError(reason instanceof Error ? reason.message : 'The gesture link could not be loaded.');
+    }).finally(() => {
+      if (current) setLoading(false);
+    });
+    return () => { current = false; };
+  }, [device.id, onError, token]);
+
+  const save = async () => {
+    const next = choice === 'none' ? '' : choice;
+    setSaving(true);
+    try {
+      await api(token, `/v1/companion/gesture-target/${encodeURIComponent(device.id)}`, 'PUT', {
+        target_device_id: next,
+      });
+      setTargetId(next);
+      toast.success(next ? 'Agent gesture pointer linked to the ADB device.' : 'Agent gesture pointer unlinked.');
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'The gesture link could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Agent gesture pointer</CardTitle>
+        <CardDescription>
+          Mirror agent touch gestures on this phone while screen sharing. Choose the enrolled ADB entry for this same device.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        <Select value={choice} onValueChange={(value) => setChoice(value || 'none')} disabled={loading || saving}>
+          <SelectTrigger aria-label="ADB device for gesture pointer" className="w-full">
+            <SelectValue placeholder="Choose an ADB device" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectItem value="none">No ADB device linked</SelectItem>
+              {targets.map((item) => (
+                <SelectItem key={item.id} value={item.id}>
+                  {item.label} · {item.online ? 'online' : 'offline'}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        {targets.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            Connect and enroll this Android phone over ADB first. The phone and ADB entry must have the same owner.
+          </p>
+        )}
+        <p className="text-sm text-muted-foreground">
+          On Android, enable <span className="font-medium text-foreground">Show agent gestures</span> and allow “display over other apps.” The pointer is visual only and does not receive taps.
+          {targetId && !targets.some((item) => item.id === targetId) && ' The linked ADB entry is unavailable; choose another device or unlink it.'}
+        </p>
+        <div>
+          <Button type="button" onClick={() => void save()} disabled={loading || saving || choice === (targetId || 'none')}>
+            {saving ? 'Saving…' : 'Save gesture link'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -1883,6 +1990,16 @@ function Viewer({
   const owner = session.owner === actor.subject && actor.role !== 'agent';
   const controller =
     !session.paused && session.controller === actor.subject && session.capabilities.includes('touch');
+  const canView = owner || session.requester === actor.subject || controller;
+  const showScreen = canView && session.capabilities.includes('screen');
+  const showCamera = Boolean(canView && supportsFrameStream && session.capabilities.includes('camera'));
+  const showMicrophone = Boolean(canView && supportsFrameStream && session.capabilities.includes('microphone'));
+  const watchSensors = showCamera || showMicrophone;
+  const watchScreen = showScreen && !controller && (preview || watchSensors);
+  const companionMode = supportsFrameStream && supportsVideo && !session.paused && pageVisible;
+  const { streams, failure: liveMediaFailure } = useLiveMedia(token, `${base}/video`,
+    !companionMode ? 'off' : watchScreen ? (watchSensors ? 'all' : 'screen') : watchSensors ? 'sensors' : 'off', true);
+  const liveScreen = companionMode && watchScreen && preview ? streams.screen : undefined;
   const treeNodes = treeObservation?.nodes ?? [];
   const treeNodeById = new Map(treeNodes.map((node) => [node.id, node]));
   const normalizedTreeQuery = treeQuery.trim().toLocaleLowerCase();
@@ -1945,7 +2062,7 @@ function Viewer({
   }, []);
 
   useEffect(() => {
-    if (!supportsFrameStream || !preview || !pageVisible || session.paused) {
+    if (!supportsFrameStream || !showScreen || !preview || !pageVisible || session.paused || liveScreen) {
       setStreamState('idle');
       setStreamMessage('');
       return;
@@ -2059,7 +2176,7 @@ function Viewer({
       closed = true;
       connection?.abort();
     };
-  }, [pageVisible, preview, session.id, session.paused, supportsFrameStream, token]);
+  }, [liveScreen, pageVisible, preview, session.id, session.paused, showScreen, supportsFrameStream, token]);
 
   useEffect(() => {
     if (!owner || session.profile !== 'personal') return;
@@ -2143,10 +2260,9 @@ function Viewer({
     };
   };
 
-  const show =
-    session.capabilities.includes('screen') && (owner || session.requester === actor.subject || controller);
   const streamDescription =
-    session.paused && supportsFrameStream
+    liveScreen ? 'Live · WebRTC'
+    : session.paused && supportsFrameStream
       ? frame
         ? `Session paused · last frame at ${time(frame.captured_at)}`
         : 'Screen sharing is paused'
@@ -2155,7 +2271,7 @@ function Viewer({
         : frame
           ? supportsFrameStream
             ? streamState === 'streaming'
-              ? `Live · Updated at ${time(frame.captured_at)}`
+              ? `JPEG preview · Updated at ${time(frame.captured_at)}`
               : `Last frame at ${time(frame.captured_at)} · ${streamState === 'error' ? streamMessage : streamState === 'waiting' ? 'waiting for the next frame' : 'reconnecting to the companion'}`
             : `Updated at ${time(frame.captured_at)}`
           : supportsFrameStream
@@ -2174,8 +2290,10 @@ function Viewer({
       : streamState === 'reconnecting'
         ? 'Reconnecting to the companion…'
         : 'Start “Share screen” in the companion app. New frames appear here automatically.';
-  if (!show) return null;
-  return (
+  const sensors = <CompanionSensors camera={showCamera} microphone={showMicrophone} supported={supportsVideo}
+    paused={Boolean(session.paused)} streams={companionMode ? streams : {}} failure={liveMediaFailure} />;
+  if (!showScreen) return sensors;
+  return (<>
     <Card aria-label="Phone screen" className="overflow-hidden">
       <CardHeader className="gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
         <div className="grid gap-1">
@@ -2190,7 +2308,7 @@ function Viewer({
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
-          {supportsVideo && !session.paused && (
+          {supportsVideo && !supportsFrameStream && !session.paused && (
             <Button
               type="button"
               variant={live ? 'secondary' : 'outline'}
@@ -2214,15 +2332,18 @@ function Viewer({
             >
               {preview
                 ? supportsFrameStream
-                  ? 'Pause stream'
+                  ? companionMode && watchSensors ? 'Pause screen preview' : 'Pause stream'
                   : 'Pause preview'
                 : supportsFrameStream
-                  ? 'Resume stream'
+                  ? companionMode && watchSensors ? 'Resume screen preview' : 'Resume stream'
                   : 'Auto-refresh'}
             </Button>
           )}
           {!live && (
-            <Button type="button" onClick={() => perform()} disabled={busy}>
+            <Button type="button" onClick={() => {
+              if (liveScreen) setPreview(false);
+              void perform();
+            }} disabled={busy}>
               <RefreshCw data-icon="inline-start" />
               {busy ? 'Working…' : 'Capture screen'}
             </Button>
@@ -2233,6 +2354,8 @@ function Viewer({
         <div className="phone-screen-stage grid min-h-72 place-items-center overflow-hidden rounded-xl border p-3 sm:min-h-96">
           {live && !session.paused ? (
             <LiveVideo token={token} path={`${base}/video`} />
+          ) : liveScreen ? (
+            <MediaVideo stream={liveScreen} label="Live phone screen" />
           ) : frame?.image ? (
             <img
               draggable="false"
@@ -2608,7 +2731,8 @@ function Viewer({
         )}
       </CardContent>
     </Card>
-  );
+    {sensors}
+  </>);
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

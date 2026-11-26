@@ -13,6 +13,7 @@ import (
 
 type Companion struct {
 	ID, Workspace, Owner, Label string
+	ControlDevice               string
 	Pairing                     CompanionPairing
 }
 
@@ -185,12 +186,85 @@ func (s *Store) EnrollCompanion(ctx context.Context, digest, token, label string
 func (s *Store) Companion(ctx context.Context, token string) (Companion, error) {
 	var phone Companion
 	err := s.systemScope(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, s.query("SELECT device,workspace,owner,label FROM companions WHERE token_digest = ?"), token).Scan(&phone.ID, &phone.Workspace, &phone.Owner, &phone.Label)
+		return tx.QueryRowContext(ctx, s.query("SELECT device,workspace,owner,label,control_device FROM companions WHERE token_digest = ?"), token).Scan(&phone.ID, &phone.Workspace, &phone.Owner, &phone.Label, &phone.ControlDevice)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return phone, wire.ErrForbidden
 	}
 	return phone, err
+}
+
+func (s *Store) CompanionControlDevice(ctx context.Context, actor wire.Actor, id string) (string, error) {
+	var owner, target string
+	err := s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx, s.query("SELECT owner,control_device FROM companions WHERE workspace = ? AND device = ?"), actor.Workspace, id).Scan(&owner, &target); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return wire.ErrNotFound
+			}
+			return err
+		}
+		if !actor.CanManage() && (actor.Role != wire.Owner || actor.Subject != owner) {
+			return wire.ErrNotFound
+		}
+		return nil
+	})
+	return target, err
+}
+
+func (s *Store) SetCompanionControlDevice(ctx context.Context, actor wire.Actor, companionID, targetID string, now time.Time) error {
+	return s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
+		var owner string
+		if err := tx.QueryRowContext(ctx, s.query("SELECT owner FROM companions WHERE workspace = ? AND device = ?"), actor.Workspace, companionID).Scan(&owner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return wire.ErrNotFound
+			}
+			return err
+		}
+		if !actor.CanManage() && (actor.Role != wire.Owner || actor.Subject != owner) {
+			return wire.ErrNotFound
+		}
+		if targetID != "" {
+			phone, err := s.deviceLocked(ctx, tx, actor.Workspace, companionID, now)
+			if err != nil {
+				return err
+			}
+			target, err := s.deviceLocked(ctx, tx, actor.Workspace, targetID, now)
+			if err != nil {
+				return err
+			}
+			if phone.Platform != "android" || phone.Mode != "companion" || target.Platform != "android" || target.Mode != "adb" ||
+				target.Owner != owner || phone.Owner != owner || !target.Enabled {
+				return wire.Error("INVALID_GESTURE_TARGET", "Choose an enrolled Android ADB device assigned to the same owner as this companion.", 400)
+			}
+			var linked string
+			err = tx.QueryRowContext(ctx, s.query("SELECT device FROM companions WHERE workspace = ? AND control_device = ? AND device <> ?"), actor.Workspace, targetID, companionID).Scan(&linked)
+			if err == nil {
+				return wire.Error("GESTURE_TARGET_IN_USE", "This ADB device is already linked to another companion.", 409)
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, s.query("UPDATE companions SET control_device = ? WHERE workspace = ? AND device = ?"), targetID, actor.Workspace, companionID); err != nil {
+			if strings.Contains(err.Error(), "companions_control_device_unique") || strings.Contains(err.Error(), "companions.control_device") {
+				return wire.Error("GESTURE_TARGET_IN_USE", "This ADB device is already linked to another companion.", 409)
+			}
+			return err
+		}
+		return s.audit(ctx, tx, actor, "companion_gesture_target_changed", companionID, "", "", targetID, now)
+	})
+}
+
+func (s *Store) CompanionForControlDevice(ctx context.Context, workspace, targetID string) (string, error) {
+	var companionID string
+	err := s.scoped(ctx, workspace, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, s.query("SELECT device FROM companions WHERE workspace = ? AND control_device = ?"), workspace, targetID).Scan(&companionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	return companionID, err
 }
 
 func (s *Store) RevokeCompanion(ctx context.Context, actor wire.Actor, id string) error {

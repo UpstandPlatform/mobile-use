@@ -54,6 +54,8 @@ class MainActivity : ComponentActivity() {
         const val STATE_PHOTO_FILE = "pending.photo.file"
         const val STATE_PHOTO_REQUEST = "pending.photo.request"
         const val STATE_MIC_REQUEST = "pending.mic.request"
+        const val STATE_LIVE_SENSOR = "pending.live.sensor"
+        const val STATE_LIVE_SESSION = "pending.live.session"
     }
 
     private lateinit var store: PairingStore
@@ -65,12 +67,15 @@ class MainActivity : ComponentActivity() {
     private var busy by mutableStateOf(false)
     private var online by mutableStateOf(false)
     private var backgroundMonitorEnabled by mutableStateOf(false)
+    private var gesturePointerEnabled by mutableStateOf(false)
     private var notificationsAvailable by mutableStateOf(false)
     private var backgroundNotificationsPending = false
+    private var gesturePointerPermissionPending = false
     private var scanningQr by mutableStateOf(false)
     private var pendingQr by mutableStateOf<PairingRequest?>(null)
     private var projectionId: String? = null
     private var micRequest: SensorRequest? = null
+    private var livePermission: Pair<MediaSource, String>? = null
     private var micJob: Job? = null
     private var photoRequest: SensorRequest? = null
     private var photoFile: File? = null
@@ -110,6 +115,12 @@ class MainActivity : ComponentActivity() {
         micRequest = null
         if (!granted || !record(request)) resolveSensor { it.denySensor(request.id) }
     }
+    private val liveSensorPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val (source, id) = livePermission ?: return@registerForActivityResult
+        livePermission = null
+        if (granted) startSensorShare(source, id)
+        else message = "${source.label} permission was denied."
+    }
     private val cameraCapturePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         val request = photoRequest ?: return@registerForActivityResult
         photoRequest = null
@@ -137,6 +148,7 @@ class MainActivity : ComponentActivity() {
         store = PairingStore(this)
         lanDiscovery = LanDiscovery(this)
         pairing = store.read()
+        gesturePointerEnabled = GesturePointerSettings.enabled(this)
         CompanionNotifications.createChannels(this)
         notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
         BackgroundConnectionSettings.refresh(this)
@@ -181,6 +193,10 @@ class MainActivity : ComponentActivity() {
         outState.putString(STATE_PHOTO_FILE, photoFile?.absolutePath)
         photoRequest?.let { outState.putStringArray(STATE_PHOTO_REQUEST, encodeSensor(it)) }
         micRequest?.let { outState.putStringArray(STATE_MIC_REQUEST, encodeSensor(it)) }
+        livePermission?.let { (source, id) ->
+            outState.putString(STATE_LIVE_SENSOR, source.id)
+            outState.putString(STATE_LIVE_SESSION, id)
+        }
     }
 
     private fun restorePending(state: Bundle) {
@@ -188,6 +204,9 @@ class MainActivity : ComponentActivity() {
         photoFile = state.getString(STATE_PHOTO_FILE)?.let { File(it) }
         photoRequest = state.getStringArray(STATE_PHOTO_REQUEST)?.let { decodeSensor(it) }
         micRequest = state.getStringArray(STATE_MIC_REQUEST)?.let { decodeSensor(it) }
+        val sensor = MediaSource.entries.firstOrNull { it.id == state.getString(STATE_LIVE_SENSOR) }
+        val liveSession = state.getString(STATE_LIVE_SESSION)
+        if (sensor != null && liveSession != null) livePermission = sensor to liveSession
     }
 
     private fun encodeSensor(request: SensorRequest) = arrayOf(request.id, request.sessionId, request.type, request.seconds.toString())
@@ -219,6 +238,27 @@ class MainActivity : ComponentActivity() {
         notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
         BackgroundConnectionSettings.refresh(this)
         backgroundMonitorEnabled = BackgroundConnectionSettings.enabled(this)
+        gesturePointerEnabled = GesturePointerSettings.enabled(this)
+        if (gesturePointerPermissionPending) {
+            gesturePointerPermissionPending = false
+            if (Settings.canDrawOverlays(this)) {
+                GesturePointerSettings.setEnabled(this, true)
+                gesturePointerEnabled = true
+                syncGesturePointerPreference(true)
+                ScreenShareService.updatePointerOverlay(this)
+                message = "Agent gesture pointer is on. It appears during active screen sharing."
+            } else {
+                GesturePointerSettings.setEnabled(this, false)
+                gesturePointerEnabled = false
+                message = "Allow mobile-use to display over other apps to enable the gesture pointer."
+            }
+        } else if (gesturePointerEnabled && !Settings.canDrawOverlays(this)) {
+            GesturePointerSettings.setEnabled(this, false)
+            gesturePointerEnabled = false
+            syncGesturePointerPreference(false)
+            ScreenShareService.updatePointerOverlay(this)
+            message = "The gesture pointer was turned off because Android overlay access was revoked."
+        }
         if (backgroundMonitorEnabled && pairing != null && notificationsAvailable) {
             BackgroundMonitorService.startIfEnabled(this)
         } else if (backgroundMonitorEnabled && !notificationsAvailable) {
@@ -262,6 +302,40 @@ class MainActivity : ComponentActivity() {
         runCatching {
             startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
         }.onFailure { message = "Open Android Settings and allow notifications for mobile-use." }
+    }
+
+    private fun handleGesturePointerToggle(enabled: Boolean) {
+        if (!enabled) {
+            gesturePointerPermissionPending = false
+            GesturePointerSettings.setEnabled(this, false)
+            gesturePointerEnabled = false
+            ScreenShareService.updatePointerOverlay(this)
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            gesturePointerPermissionPending = true
+            runCatching {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            }.onFailure {
+                gesturePointerPermissionPending = false
+                message = "Open Android Settings and allow mobile-use to display over other apps."
+            }
+            return
+        }
+        GesturePointerSettings.setEnabled(this, true)
+        gesturePointerEnabled = true
+        syncGesturePointerPreference(true)
+        ScreenShareService.updatePointerOverlay(this)
+        message = "Agent gesture pointer is on. It appears during active screen sharing."
+    }
+
+    private fun syncGesturePointerPreference(enabled: Boolean) {
+        val current = pairing ?: return
+        lifecycleScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { CompanionApi(current).gesturePointer(enabled) }
+            }
+        }
     }
 
     private fun handleDeepLink(intent: Intent?) {
@@ -364,15 +438,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun shareSensor(source: MediaSource, id: String) {
+        if (livePermission != null) return
+        val permission = SensorShareService.permission(source)
+        if (checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED) {
+            startSensorShare(source, id)
+        } else {
+            livePermission = source to id
+            liveSensorPermission.launch(permission)
+        }
+    }
+
+    private fun startSensorShare(source: MediaSource, id: String) {
+        if (pairing == null) return
+        message = ""
+        runCatching { SensorShareService.start(this, source, id) }
+            .onFailure { message = "${source.label} sharing could not start." }
+    }
+
     private fun stopSession(id: String) {
         val current = pairing ?: return
         attending = null
         projectionId = null
         micRequest = null
+        livePermission = null
         micJob?.cancel()
         ScreenShareService.stop(this)
+        if (SensorSharing.camera.value == id) SensorShareService.stop(this, MediaSource.CAMERA)
+        if (SensorSharing.microphone.value == id) SensorShareService.stop(this, MediaSource.MICROPHONE)
         Sharing.error.value = null
-        Sharing.lastFrameAt.value = null
+        Sharing.hasFrames.value = false
         CompanionNotifications.clearScreenShareError(this)
         lifecycleScope.launch {
             try {
@@ -421,7 +516,10 @@ class MainActivity : ComponentActivity() {
     private fun CompanionUI() {
         val sharing by Sharing.session.collectAsState()
         val sharingError by Sharing.error.collectAsState()
-        val lastFrameAt by Sharing.lastFrameAt.collectAsState()
+        val hasFrames by Sharing.hasFrames.collectAsState()
+        val cameraShare by SensorSharing.camera.collectAsState()
+        val microphoneShare by SensorSharing.microphone.collectAsState()
+        val sensorError by SensorSharing.error.collectAsState()
         val backgroundConnectionOn by BackgroundConnectionSettings.state.collectAsState()
         val discoveredHosts by lanDiscovery.hosts.collectAsState()
         var origin by rememberSaveable { mutableStateOf("") }
@@ -767,6 +865,39 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
+                        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text("Agent gesture pointer", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            if (gesturePointerEnabled) "On · agent touch gestures appear as an animated cursor while sharing."
+                                            else "Off · agent gestures stay hidden on this phone.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = colors.onSurfaceVariant,
+                                        )
+                                    }
+                                    Switch(
+                                        checked = gesturePointerEnabled,
+                                        onCheckedChange = ::handleGesturePointerToggle,
+                                    )
+                                }
+                                Text(
+                                    "The pointer is visual only: taps pass through to the app. Android asks for display-over-other-apps access once. Secure overlay rendering keeps the pointer out of shared screen frames.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                if (gesturePointerEnabled && !Settings.canDrawOverlays(this@MainActivity)) {
+                                    TextButton(onClick = { handleGesturePointerToggle(true) }) {
+                                        Text("Allow display over other apps")
+                                    }
+                                }
+                            }
+                        }
                         status.sessions.forEach { item ->
                             OutlinedCard(Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -779,7 +910,7 @@ class MainActivity : ComponentActivity() {
                                     } else if (item.state == "active") {
                                         if (sharing == item.id) {
                                             Text(
-                                                if (lastFrameAt == null) "Screen sharing is on · waiting for first frame…" else "Screen frames are sending",
+                                                if (hasFrames) "Screen frames are sending" else "Screen sharing is on · waiting for first frame…",
                                                 color = colors.primary,
                                                 style = MaterialTheme.typography.labelLarge,
                                             )
@@ -794,6 +925,21 @@ class MainActivity : ComponentActivity() {
                                             if (sharing != item.id && "screen" in item.caps) Button(enabled = online && !busy, onClick = { share(item.id) }) { Text("Share screen") }
                                             OutlinedButton(onClick = { stopSession(item.id) }) { Text("Stop", color = colors.error) }
                                         }
+                                        if ("camera" in item.caps) {
+                                            val active = cameraShare == item.id
+                                            OutlinedButton(enabled = active || online && !busy && cameraShare == null, onClick = {
+                                                if (active) SensorShareService.stop(this@MainActivity, MediaSource.CAMERA)
+                                                else shareSensor(MediaSource.CAMERA, item.id)
+                                            }) { Text(if (active) "Stop camera" else "Share camera") }
+                                        }
+                                        if ("microphone" in item.caps) {
+                                            val active = microphoneShare == item.id
+                                            OutlinedButton(enabled = active || online && !busy && microphoneShare == null, onClick = {
+                                                if (active) SensorShareService.stop(this@MainActivity, MediaSource.MICROPHONE)
+                                                else shareSensor(MediaSource.MICROPHONE, item.id)
+                                            }) { Text(if (active) "Stop microphone" else "Share microphone") }
+                                        }
+                                        sensorError?.let { Text(it, color = colors.error, style = MaterialTheme.typography.bodySmall) }
                                     }
                                 }
                             }
@@ -803,7 +949,7 @@ class MainActivity : ComponentActivity() {
                                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(if (request.type == "camera") "Camera photo requested" else "${request.seconds}-second microphone clip requested", style = MaterialTheme.typography.titleMedium)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(enabled = online && !busy, onClick = {
+                                        Button(enabled = online && !busy && (if (request.type == "camera") cameraShare == null else microphoneShare == null), onClick = {
                                             if (request.type == "camera") takePhoto(request)
                                             else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) record(request)
                                             else { micRequest = request; microphone.launch(Manifest.permission.RECORD_AUDIO) }
@@ -823,6 +969,10 @@ class MainActivity : ComponentActivity() {
                 title = { Text("Unpair this phone?") }, text = { Text("Sharing stops and this phone will need a new pairing code.") },
                 confirmButton = { TextButton(onClick = {
                     ScreenShareService.stop(this@MainActivity)
+                    SensorShareService.stop(this@MainActivity, MediaSource.CAMERA)
+                    SensorShareService.stop(this@MainActivity, MediaSource.MICROPHONE)
+                    livePermission = null
+                    SensorSharing.error.value = null
                     BackgroundMonitorService.setEnabled(this@MainActivity, false)
                     backgroundMonitorEnabled = false
                     val previous = pairing

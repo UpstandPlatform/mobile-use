@@ -35,7 +35,7 @@ internal class ScreenFrameStream(
 ) {
     private val lock = Any()
     private val retryHandler = Handler(Looper.getMainLooper())
-    private val client = buildClient()
+    private val client = companionSocketClient(pairing)
     @Volatile private var mode = FrameStreamMode.CONNECTING
     @Volatile private var closed = false
     private var socket: WebSocket? = null
@@ -168,17 +168,19 @@ internal class ScreenFrameStream(
         }
     }
 
-    private fun buildClient(): OkHttpClient {
-        val builder = OkHttpClient.Builder()
-            .connectTimeout(4, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .writeTimeout(4, TimeUnit.SECONDS)
-            .pingInterval(5, TimeUnit.SECONDS)
-        pairing.certPin.takeIf { it.isNotEmpty() }?.let { pin ->
-            val pinned = buildPinnedSsl(pin)
-            builder.sslSocketFactory(pinned.context.socketFactory, pinned.trustManager)
-                .hostnameVerifier(pinned.hostnameVerifier)
-        }
-        return builder.build()
+}
+
+internal fun companionSocketClient(pairing: Pairing): OkHttpClient {
+    val builder = OkHttpClient.Builder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(4, TimeUnit.SECONDS)
+        .pingInterval(5, TimeUnit.SECONDS)
+        .followRedirects(false)
+    pairing.certPin.takeIf { it.isNotEmpty() }?.let { pin ->
+        val pinned = buildPinnedSsl(pin)
+        builder.sslSocketFactory(pinned.context.socketFactory, pinned.trustManager)
+            .hostnameVerifier(pinned.hostnameVerifier)
     }
+    return builder.build()
 }

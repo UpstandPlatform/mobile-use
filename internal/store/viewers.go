@@ -10,18 +10,19 @@ import (
 
 const ViewerTTL = 10 * time.Second
 
-func (s *Store) VideoTarget(ctx context.Context, actor wire.Actor, id string, now time.Time) (Target, error) {
+func (s *Store) VideoTarget(ctx context.Context, actor wire.Actor, id string, now time.Time) (Target, []wire.Capability, error) {
 	return s.viewer(ctx, actor, id, "", now)
 }
 
-func (s *Store) OpenViewer(ctx context.Context, actor wire.Actor, id string, now time.Time) (Target, string, error) {
+func (s *Store) OpenViewer(ctx context.Context, actor wire.Actor, id string, now time.Time) (Target, []wire.Capability, string, error) {
 	viewer := wire.NewID()
-	target, err := s.viewer(ctx, actor, id, viewer, now)
-	return target, viewer, err
+	target, sources, err := s.viewer(ctx, actor, id, viewer, now)
+	return target, sources, viewer, err
 }
 
-func (s *Store) viewer(ctx context.Context, actor wire.Actor, id, viewer string, now time.Time) (Target, error) {
+func (s *Store) viewer(ctx context.Context, actor wire.Actor, id, viewer string, now time.Time) (Target, []wire.Capability, error) {
 	var target Target
+	var sources []wire.Capability
 	err := s.scoped(ctx, actor.Workspace, func(tx *sql.Tx) error {
 		initial, err := s.sessionTx(ctx, tx, actor.Workspace, id)
 		if err != nil {
@@ -46,7 +47,19 @@ func (s *Store) viewer(ctx context.Context, actor wire.Actor, id, viewer string,
 		if !isLive(device, session, now) || session.Paused {
 			return wire.ErrExpired
 		}
-		if !device.LiveVideo || !device.Capabilities[wire.Screen] || !slices.Contains(session.Capabilities, wire.Screen) {
+		if !device.LiveVideo {
+			return wire.ErrUnsupported
+		}
+		supported := []wire.Capability{wire.Screen}
+		if device.Mode == "companion" {
+			supported = append(supported, wire.Camera, wire.Microphone)
+		}
+		for _, source := range supported {
+			if device.Capabilities[source] && slices.Contains(session.Capabilities, source) {
+				sources = append(sources, source)
+			}
+		}
+		if len(sources) == 0 {
 			return wire.ErrUnsupported
 		}
 		target = Target{actor.Workspace, device.Connector, device.ID, id, session.Generation}
@@ -68,7 +81,7 @@ func (s *Store) viewer(ctx context.Context, actor wire.Actor, id, viewer string,
 		}
 		return s.audit(ctx, tx, actor, "video_opened", device.ID, id, "", "", now)
 	})
-	return target, err
+	return target, sources, err
 }
 
 func (s *Store) RenewViewer(ctx context.Context, target Target, id string, now time.Time) error {

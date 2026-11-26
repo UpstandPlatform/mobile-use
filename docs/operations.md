@@ -56,6 +56,8 @@ The private HTTP endpoint exposes `/healthz`, `/readyz`, and an authorized Prome
 
 Android connectors verify the SHA-256 of the official scrcpy 4.0 server before capture. When the connector and console service run separately, the H.264 packets cross a dedicated stream on their mTLS link. The browser receives video through a WebRTC peer on the console service.
 
+The Android companion sends H.264 screen and camera video and Opus microphone audio through authenticated WebSockets to the console service. Allow WebSocket upgrades for `/companion/sessions/*/media/*` at the phone-facing HTTPS proxy. The console negotiates the approved tracks on one WebRTC connection and can fall back to JPEG previews for the screen. For a replicated deployment, route a companion's publisher and viewer to the same service instance.
+
 Direct ICE connections work when the browser can reach the API host's ICE network addresses. For networks that need a relay, `deploy/turn.compose.yaml` configures coturn on a Linux host. Set the listener interface, advertised IP or NAT mapping, certificate directory, realm, and shared secret. Allow the configured TURN listener and UDP relay port range for authorized networks. Use the same shared secret with `MOBILE_USE_TURN_URLS` on the API. For example, use `turns:turn.example.internal:5349?transport=tcp`. `MOBILE_USE_TURN_RELAY_ONLY=1` requires TURN for both WebRTC peers. The Helm chart exposes the corresponding `turnURLs`, `turnSecret`, and `turnRelayOnly` values.
 
 ## Android app maintenance

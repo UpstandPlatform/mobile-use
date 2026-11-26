@@ -70,6 +70,7 @@ func TestMigratePersistedCompanionPairingState(t *testing.T) {
 	statement := "CREATE TABLE mobile_use_schema_migrations (version INTEGER PRIMARY KEY);" +
 		"INSERT INTO mobile_use_schema_migrations(version) VALUES (1);" +
 		"CREATE TABLE audit (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, occurred_at BIGINT NOT NULL, payload TEXT NOT NULL);" +
+		"CREATE TABLE companions (token_digest TEXT PRIMARY KEY, device TEXT NOT NULL UNIQUE, workspace TEXT NOT NULL, owner TEXT NOT NULL, label TEXT NOT NULL);" +
 		"CREATE TABLE companion_pairings (digest TEXT PRIMARY KEY, workspace TEXT NOT NULL, owner TEXT NOT NULL, expires_at BIGINT NOT NULL);" +
 		"INSERT INTO companion_pairings(digest,workspace,owner,expires_at) VALUES ('legacy-digest','legacy-workspace','owner',9999999999999);"
 	_, err = db.Exec(statement)
@@ -91,8 +92,8 @@ func TestMigratePersistedCompanionPairingState(t *testing.T) {
 	if err := opened.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM mobile_use_schema_migrations").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("schema version = %d, want 4", version)
 	}
 	var count int
 	if err := opened.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM companion_pairings").Scan(&count); err != nil {
@@ -119,9 +120,35 @@ func TestMigratePersistedCompanionPairingState(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
 	for _, required := range []string{"id", "creator_role", "auto_enroll", "grant_agents", "state", "device", "label", "auto_enrolled"} {
 		if !found[required] {
 			t.Errorf("pairing migration did not add %q", required)
 		}
+	}
+	var controlDeviceColumn bool
+	rows, err = opened.db.QueryContext(t.Context(), "PRAGMA table_info(companions)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primary int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primary); err != nil {
+			t.Fatal(err)
+		}
+		if name == "control_device" {
+			controlDeviceColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !controlDeviceColumn {
+		t.Fatal("companion migration did not add the control_device link")
 	}
 }

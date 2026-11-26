@@ -22,6 +22,9 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
+import android.view.PixelCopy
+import android.view.Surface
 import android.view.WindowManager
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
@@ -32,7 +35,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 object Sharing {
     val session = MutableStateFlow<String?>(null)
     val error = MutableStateFlow<String?>(null)
-    val lastFrameAt = MutableStateFlow<Long?>(null)
+    val hasFrames = MutableStateFlow(false)
 }
 
 class ScreenShareService : Service() {
@@ -46,11 +49,19 @@ class ScreenShareService : Service() {
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
     private var reader: ImageReader? = null
+    private var encoder: AvcEncoder? = null
     private var sessionId: String? = null
     private var api: CompanionApi? = null
+    private var activePairing: Pairing? = null
     private var frameStream: ScreenFrameStream? = null
+    private var gestureStream: GestureEventStream? = null
+    private var pointerOverlay: GesturePointerOverlay? = null
+    private var mediaStream: LiveMediaSocket? = null
+    private var allowVideo = true
+    private var bitRate = 900_000
     private var lastFrame = 0L
     private var lastCapturedAt = 0L
+    private var lastDeliveredAt: Long? = null
     @Volatile
     private var lastSuccess = 0L
     private var startedAt = 0L
@@ -72,7 +83,7 @@ class ScreenShareService : Service() {
             if (now - lastSuccess > 9500L) {
                 reportError("The phone is reconnecting to the server. Screen sharing will resume when Wi-Fi is back.")
             }
-            val frameAt = Sharing.lastFrameAt.value
+            val frameAt = lastDeliveredAt
             val captureAge = now - startedAt
             if (lastCapturedAt == 0L && captureAge > FIRST_FRAME_RECOVERY_MS && !firstFrameRecoveryAttempted) {
                 firstFrameRecoveryAttempted = true
@@ -88,7 +99,7 @@ class ScreenShareService : Service() {
                 reportError("Android is capturing the screen, but the server has not confirmed a frame. Check the phone’s Wi-Fi and server connection.")
             } else if (frameAt != null && now - frameAt > 10000L) {
                 reportError("Screen frames stopped reaching the server. Check Wi-Fi, then restart screen sharing.")
-            } else if (frameAt != null && now - frameAt > FRAME_STALE_MS && frameStream?.mode() == FrameStreamMode.READY) {
+            } else if (encoder == null && frameAt != null && now - frameAt > FRAME_STALE_MS && frameStream?.mode() == FrameStreamMode.READY) {
                 reportError("The live screen stream stalled. Reconnecting to the server…")
                 frameStream?.reconnect()
             }
@@ -128,6 +139,11 @@ class ScreenShareService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == UPDATE_POINTER_OVERLAY) {
+            updatePointerState()
+            if (sessionId == null) stopSelf()
+            return START_NOT_STICKY
+        }
         if (intent?.action == STOP) {
             stopSelf()
             return START_NOT_STICKY
@@ -148,19 +164,17 @@ class ScreenShareService : Service() {
         }
         startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         sessionId = id
+        activePairing = pairing
         api = CompanionApi(pairing)
+        if (GesturePointerSettings.enabled(this)) {
+            control.submit { runCatching { api?.gesturePointer(true) } }
+        }
         frameIntervalMs = if (pairing.mode == "lan") LAN_FRAME_INTERVAL_MS else REMOTE_FRAME_INTERVAL_MS
+        bitRate = if (pairing.mode == "lan") 1_500_000 else 900_000
         frameStream = ScreenFrameStream(
             pairing = pairing,
             sessionId = id,
-            onFrame = {
-                if (!closing.get()) {
-                    val uploadedAt = SystemClock.elapsedRealtime()
-                    lastSuccess = uploadedAt
-                    Sharing.lastFrameAt.value = uploadedAt
-                    reportError(null)
-                }
-            },
+            onFrame = { captureHandler.post(::frameDelivered) },
             onError = { reportError(it) },
             onFatal = {
                 reportError(it)
@@ -168,6 +182,11 @@ class ScreenShareService : Service() {
             },
             onLegacyServer = { reportError(null) },
         ).also { it.start() }
+        mediaStream = LiveMediaSocket(pairing, id, MediaSource.SCREEN, captureHandler,
+            onReady = { encoder?.requestKeyFrame() }, onSample = ::frameDelivered,
+            onUnavailable = ::useJpegCapture, onFatal = { useJpegCapture() },
+        ).also { it.start() }
+        updatePointerState()
         lastSuccess = SystemClock.elapsedRealtime()
         startedAt = lastSuccess
         lastCapturedAt = 0L
@@ -176,7 +195,7 @@ class ScreenShareService : Service() {
         sourceWidth = 0
         sourceHeight = 0
         reportError(null)
-        Sharing.lastFrameAt.value = null
+        Sharing.hasFrames.value = false
         try {
             val manager = getSystemService(MediaProjectionManager::class.java)
             projection = manager.getMediaProjection(intent.getIntExtra(RESULT, 0), permission)
@@ -185,19 +204,14 @@ class ScreenShareService : Service() {
                 override fun onStop() { stopSelf() }
                 override fun onCapturedContentResize(width: Int, height: Int) {
                     if (closing.get() || width < 1 || height < 1) return
-                    sourceWidth = width
-                    sourceHeight = height
-                    if (display != null) configure(width, height)
+                    if (width != sourceWidth || height != sourceHeight) configureCapture(width, height)
                 }
             }, captureHandler)
             val bounds = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
             captureHandler.post {
                 val width = sourceWidth.takeIf { it > 0 } ?: bounds.width()
                 val height = sourceHeight.takeIf { it > 0 } ?: bounds.height()
-                runCatching { configure(width, height) }.onFailure {
-                    reportError("Android could not start the screen capture surface. Reopen Share screen and approve the prompt again.")
-                    stopSelf()
-                }
+                if (display == null) configureCapture(width, height)
             }
             captureHandler.postDelayed(heartbeat, 2000)
             Sharing.session.value = id
@@ -207,86 +221,181 @@ class ScreenShareService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun configureCapture(width: Int, height: Int) {
+        runCatching { configure(width, height) }.onFailure {
+            reportError("Android could not start the screen capture surface. Reopen Share screen and approve the prompt again.")
+            stopSelf()
+        }
+    }
+
+    private fun useJpegCapture() {
+        if (closing.get()) return
+        allowVideo = false
+        mediaStream?.close()
+        mediaStream = null
+        if (encoder != null) configureCapture(sourceWidth, sourceHeight)
+    }
+
+    private fun updatePointerState() {
+        val shouldShow = sessionId != null && GesturePointerSettings.enabled(this) && Settings.canDrawOverlays(this)
+        if (!shouldShow) {
+            pointerOverlay?.close()
+            pointerOverlay = null
+            gestureStream?.close()
+            gestureStream = null
+            return
+        }
+        if (pointerOverlay == null) pointerOverlay = GesturePointerOverlay(this)
+        if (gestureStream == null) {
+            val pairing = activePairing ?: return
+            val id = sessionId ?: return
+            gestureStream = GestureEventStream(
+                pairing = pairing,
+                sessionId = id,
+                onGesture = { pointerOverlay?.show(it) },
+                onFatal = { /* Screen sharing remains available if the visual pointer channel is unavailable. */ },
+            ).also { it.start() }
+        }
+    }
+
     private fun configure(width: Int, height: Int) {
         if (width < 1 || height < 1 || closing.get()) return
-        val source = projection ?: throw IllegalStateException("The screen projection is unavailable.")
         sourceWidth = width
         sourceHeight = height
         val scale = minOf(1f, 960f / maxOf(width, height))
-        val outputWidth = (width * scale).roundToInt()
-        val outputHeight = (height * scale).roundToInt()
+        val outputWidth = (2 * (width * scale / 2).roundToInt()).coerceAtLeast(2)
+        val outputHeight = (2 * (height * scale / 2).roundToInt()).coerceAtLeast(2)
+        val nextEncoder = if (allowVideo) runCatching {
+            AvcEncoder(outputWidth, outputHeight, bitRate, captureHandler, repeatLastFrame = true,
+                onFrame = ::encodedFrame, onError = { captureHandler.post { if (encoder != null) useJpegCapture() } })
+        }.getOrElse {
+            allowVideo = false
+            mediaStream?.close()
+            mediaStream = null
+            null
+        } else null
+        val nextReader = if (nextEncoder == null) {
+            ImageReader.newInstance(outputWidth, outputHeight, PixelFormat.RGBA_8888, 2).apply {
+                setOnImageAvailableListener(::frameAvailable, captureHandler)
+            }
+        } else null
+        try {
+            attachCaptureSurface(outputWidth, outputHeight, nextEncoder?.surface ?: checkNotNull(nextReader).surface)
+        } catch (error: RuntimeException) {
+            nextEncoder?.close()
+            nextReader?.close()
+            throw error
+        }
+        encoder?.close()
+        reader?.close()
+        encoder = nextEncoder
+        reader = nextReader
+        lastFrame = 0L
+    }
+
+    private fun attachCaptureSurface(outputWidth: Int, outputHeight: Int, surface: Surface) {
+        val source = projection ?: throw IllegalStateException("The screen projection is unavailable.")
         val density = resources.configuration.densityDpi
-        val next = ImageReader.newInstance(outputWidth, outputHeight, PixelFormat.RGBA_8888, 2)
-        next.setOnImageAvailableListener(::frameAvailable, captureHandler)
-        val old = reader
-        reader = next
         val existing = display
         if (existing == null) {
             display = source.createVirtualDisplay("mobile-use screen sharing", outputWidth, outputHeight, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, next.surface, null, captureHandler)
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, captureHandler)
                 ?: throw IllegalStateException("Android did not create a virtual display.")
         } else {
             existing.resize(outputWidth, outputHeight, density)
-            existing.surface = next.surface
+            existing.surface = surface
         }
-        old?.close()
+    }
+
+    private fun frameDelivered() {
+        if (closing.get()) return
+        val uploadedAt = SystemClock.elapsedRealtime()
+        lastSuccess = uploadedAt
+        val firstOrRecovering = lastDeliveredAt == null || Sharing.error.value != null
+        lastDeliveredAt = uploadedAt
+        Sharing.hasFrames.value = true
+        if (firstOrRecovering) reportError(null)
+    }
+
+    private fun encodedFrame(output: AvcEncoder, pts: Long, bytes: ByteArray, key: Boolean) {
+        if (closing.get() || encoder !== output) return
+        val now = SystemClock.elapsedRealtime()
+        lastCapturedAt = now
+        val stream = mediaStream ?: return
+        stream.send(pts, bytes, key)
+        val interval = if (stream.previewRequested) frameIntervalMs else SNAPSHOT_INTERVAL_MS
+        if (now - lastFrame < interval || !canUploadJpeg() || !uploading.compareAndSet(false, true)) return
+        lastFrame = now
+        val bitmap = Bitmap.createBitmap(output.width, output.height, Bitmap.Config.ARGB_8888)
+        runCatching {
+            PixelCopy.request(output.surface, bitmap, { result ->
+                if (result == PixelCopy.SUCCESS && encoder === output && !closing.get()) {
+                    uploadBitmap(bitmap)
+                } else {
+                    bitmap.recycle()
+                    uploading.set(false)
+                }
+            }, captureHandler)
+        }.onFailure {
+            bitmap.recycle()
+            uploading.set(false)
+        }
     }
 
     private fun frameAvailable(source: ImageReader) {
-        if (closing.get()) return
+        if (closing.get() || reader !== source) return
         val image = runCatching { source.acquireLatestImage() }.getOrNull() ?: return
         image.use { frame ->
             val now = SystemClock.elapsedRealtime()
             lastCapturedAt = now
-            if (now - lastFrame < frameIntervalMs || !uploading.compareAndSet(false, true)) return
+            if (now - lastFrame < frameIntervalMs || !canUploadJpeg() || !uploading.compareAndSet(false, true)) return
             lastFrame = now
-            val id = sessionId
-            val client = api
-            val stream = frameStream
-            if (id == null || client == null || stream == null) { uploading.set(false); return }
-            val streamMode = stream.mode()
-            if (streamMode == FrameStreamMode.CONNECTING || streamMode == FrameStreamMode.CLOSED) {
-                uploading.set(false)
-                return
-            }
-            val bytes = runCatching {
+            val bitmap = runCatching {
                 val plane = frame.planes[0]
-                val bitmap = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, frame.height, Bitmap.Config.ARGB_8888)
+                val padded = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, frame.height, Bitmap.Config.ARGB_8888)
+                var crop: Bitmap? = null
                 try {
-                    bitmap.copyPixelsFromBuffer(plane.buffer)
-                    val crop = Bitmap.createBitmap(bitmap, 0, 0, frame.width, frame.height)
-                    try { ByteArrayOutputStream().also { crop.compress(Bitmap.CompressFormat.JPEG, 68, it) }.toByteArray() }
-                    finally { if (crop !== bitmap) crop.recycle() }
-                } finally { bitmap.recycle() }
+                    padded.copyPixelsFromBuffer(plane.buffer)
+                    Bitmap.createBitmap(padded, 0, 0, frame.width, frame.height).also { crop = it }
+                } finally { if (padded !== crop) padded.recycle() }
             }.getOrNull()
-            if (bytes == null) {
+            if (bitmap == null) {
                 reportError("The phone could not encode a screen frame. Restart screen sharing and try again.")
                 uploading.set(false)
                 return
             }
-            if (streamMode == FrameStreamMode.READY) {
-                stream.send(bytes)
-                uploading.set(false)
-                return
-            }
-            transfer.submit {
-                try {
-                    if (!closing.get()) {
+            uploadBitmap(bitmap)
+        }
+    }
+
+    private fun canUploadJpeg(): Boolean = frameStream?.mode() in setOf(FrameStreamMode.READY, FrameStreamMode.LEGACY)
+
+    private fun uploadBitmap(bitmap: Bitmap) {
+        val stream = frameStream
+        val client = api
+        val id = sessionId
+        transfer.submit {
+            try {
+                if (closing.get() || stream == null || client == null || id == null) return@submit
+                val bytes = ByteArrayOutputStream().also { out ->
+                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, 68, out))
+                }.toByteArray()
+                when (stream.mode()) {
+                    FrameStreamMode.READY -> stream.send(bytes)
+                    FrameStreamMode.LEGACY -> {
                         client.frame(id, bytes)
-                        captureHandler.post {
-                            val uploadedAt = SystemClock.elapsedRealtime()
-                            lastSuccess = uploadedAt
-                            Sharing.lastFrameAt.value = uploadedAt
-                            reportError(null)
-                        }
+                        captureHandler.post(::frameDelivered)
                     }
-                } catch (error: ApiFailure) {
-                    if (error.status != 429) reportError(error.message)
-                    if (error.status in setOf(401, 403, 404, 409)) stopSelf()
-                } catch (error: Exception) {
-                    reportError(error.message ?: "The phone could not send a screen frame. Check Wi-Fi and the server address.")
-                    // The capture watchdog stops sharing if the server remains unreachable.
-                } finally { uploading.set(false) }
+                    else -> Unit
+                }
+            } catch (error: ApiFailure) {
+                if (error.status != 429) reportError(error.message)
+                if (error.status in setOf(401, 403, 404, 409)) stopSelf()
+            } catch (error: Exception) {
+                reportError(error.message ?: "The phone could not send a screen frame. Check Wi-Fi and the server address.")
+            } finally {
+                bitmap.recycle()
+                uploading.set(false)
             }
         }
     }
@@ -317,20 +426,26 @@ class ScreenShareService : Service() {
         closing.set(true)
         runCatching { unregisterReceiver(displayStateReceiver) }
         captureHandler.removeCallbacks(heartbeat)
+        gestureStream?.close()
+        gestureStream = null
+        pointerOverlay?.close()
+        pointerOverlay = null
         frameStream?.close()
         val id = sessionId
         val client = api
         captureHandler.post {
+            mediaStream?.close()
             if (id != null && client != null) transfer.submit { runCatching { client.session(id, "end") } }
             transfer.shutdown()
             control.shutdown()
             display?.release()
+            encoder?.close()
             reader?.close()
             projection?.stop()
             captureThread.quitSafely()
         }
         Sharing.session.value = null
-        Sharing.lastFrameAt.value = null
+        Sharing.hasFrames.value = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -342,11 +457,13 @@ class ScreenShareService : Service() {
         private const val NOTIFICATION_ID = 100
         private const val LAN_FRAME_INTERVAL_MS = 125L
         private const val REMOTE_FRAME_INTERVAL_MS = 200L
+        private const val SNAPSHOT_INTERVAL_MS = 750L
         private const val FRAME_STALE_MS = 3500L
         private const val FIRST_FRAME_RECOVERY_MS = 6000L
         private const val FIRST_FRAME_TIMEOUT_MS = 15000L
         private const val FRAME_ACK_TIMEOUT_MS = 5000L
         private const val STOP = "org.mobileuse.companion.STOP"
+        private const val UPDATE_POINTER_OVERLAY = "org.mobileuse.companion.UPDATE_POINTER_OVERLAY"
         private const val SESSION = "session"
         private const val PERMISSION = "permission"
         private const val RESULT = "result"
@@ -357,5 +474,11 @@ class ScreenShareService : Service() {
         }
 
         fun stop(context: Context) { context.stopService(Intent(context, ScreenShareService::class.java)) }
+
+        fun updatePointerOverlay(context: Context) {
+            runCatching {
+                context.startService(Intent(context, ScreenShareService::class.java).setAction(UPDATE_POINTER_OVERLAY))
+            }
+        }
     }
 }

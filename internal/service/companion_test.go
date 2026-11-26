@@ -414,6 +414,95 @@ func TestCompanionFrameWebSocketAcksFramesAndFeedsConsole(t *testing.T) {
 	}
 }
 
+func TestSuccessfulDeviceGestureStreamsToLinkedCompanion(t *testing.T) {
+	f := setup(t)
+	pairing := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", map[string]any{
+		"auto_enroll":  true,
+		"grant_agents": []string{"agent"},
+	})
+	var phone struct {
+		DeviceID string `json:"device_id"`
+		Token    string `json:"token"`
+	}
+	opening := []byte(wire.Marshal(map[string]string{
+		"code": pairing["code"].(string), "label": "Gesture pointer phone",
+	}))
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, http.StatusCreated), &phone); err != nil {
+		t.Fatal(err)
+	}
+	phonePost(t, f.origin, phone.Token, "/companion/heartbeat", "application/json", []byte(`{"present_session":""}`), http.StatusOK)
+
+	controlCaps := []wire.Capability{wire.Screen, wire.Touch}
+	enroll(t, f, f.device, wire.Personal, controlCaps)
+	gestureTargetPath := "/v1/companion/gesture-target/" + phone.DeviceID
+	request[map[string]string](t, f.owner, http.MethodPut, gestureTargetPath, map[string]string{"target_device_id": f.device})
+	if target := request[map[string]string](t, f.owner, http.MethodGet, gestureTargetPath, nil); target["target_device_id"] != f.device {
+		t.Fatalf("gesture target = %q, want %q", target["target_device_id"], f.device)
+	}
+
+	sharing := request[wire.Session](t, f.owner, http.MethodPost, "/v1/sessions", wire.StartSession{
+		DeviceID: phone.DeviceID, Purpose: "Watch agent gesture feedback", Capabilities: []wire.Capability{wire.Screen},
+	})
+	phonePost(t, f.origin, phone.Token, "/companion/sessions/"+sharing.ID+"/approve", "application/json", []byte(`{}`), http.StatusOK)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	socketURL := "ws" + strings.TrimPrefix(f.origin, "http") + "/companion/sessions/" + sharing.ID + "/gestures"
+	socket, response, err := websocket.DefaultDialer.DialContext(ctx, socketURL, http.Header{
+		"Authorization": []string{"Bearer " + phone.Token},
+	})
+	if err != nil {
+		if response != nil {
+			response.Body.Close()
+		}
+		t.Fatalf("open companion gesture stream: %v", err)
+	}
+	defer socket.Close()
+
+	control := request[wire.Session](t, f.agent, http.MethodPost, "/v1/sessions", wire.StartSession{
+		DeviceID: f.device, Purpose: "Verify streamed touch feedback", Capabilities: controlCaps,
+	})
+	request[wire.Session](t, f.owner, http.MethodPost, "/v1/sessions/"+control.ID+"/approve", nil)
+	observed := request[wire.Result](t, f.agent, http.MethodPost, "/v1/sessions/"+control.ID+"/operations", wire.Operation{
+		Kind: "observe", Observe: &wire.ObserveRequest{Screen: true},
+	})
+	if observed.Observation == nil {
+		t.Fatal("control observation omitted its frame")
+	}
+	result := request[wire.Result](t, f.agent, http.MethodPost, "/v1/sessions/"+control.ID+"/operations", wire.Operation{
+		Kind: "act",
+		Action: &wire.Action{
+			Type: "tap", FrameID: observed.Observation.FrameID,
+			Point: &wire.Point{X: 0.25, Y: 0.75}, DurationMS: 160,
+		},
+	})
+	if result.State != wire.Succeeded {
+		t.Fatalf("agent tap state = %q, want succeeded: %+v", result.State, result.Fault)
+	}
+
+	if err := socket.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err := socket.ReadMessage()
+	if err != nil {
+		t.Fatalf("read gesture pointer event: %v", err)
+	}
+	var event struct {
+		Type       string           `json:"type"`
+		Gesture    string           `json:"gesture"`
+		DurationMS int              `json:"duration_ms"`
+		Paths      []wire.TouchPath `json:"paths"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "gesture" || event.Gesture != "tap" || event.DurationMS != 160 ||
+		len(event.Paths) != 1 || event.Paths[0].Start != (wire.Point{X: 0.25, Y: 0.75}) ||
+		event.Paths[0].End != event.Paths[0].Start {
+		t.Fatalf("unexpected gesture pointer event: %+v", event)
+	}
+}
+
 func TestDeleteDeviceEndsSessionRevokesCompanionAndHidesInventory(t *testing.T) {
 	f := setup(t)
 	code := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", nil)["code"].(string)

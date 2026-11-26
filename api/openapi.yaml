@@ -83,7 +83,7 @@ paths:
     get:
       operationId: getVideoNetworkConfiguration
       responses:
-        '200': {description: Authorized ICE servers, short-lived TURN credentials, and the transport policy}
+        '200': {description: Authorized ICE servers, short-lived TURN credentials, the transport policy, and permitted media sources}
     post:
       operationId: openVideoViewer
       requestBody:
@@ -96,6 +96,13 @@ paths:
               properties:
                 type: {const: offer}
                 sdp: {type: string, maxLength: 65536}
+                sources:
+                  type: array
+                  description: Sources requested in the offer's media sections. Omit for a screen-only offer.
+                  minItems: 1
+                  maxItems: 3
+                  uniqueItems: true
+                  items: {type: string, enum: [screen, camera, microphone]}
       responses:
         '201': {description: WebRTC answer and viewer ID}
   /v1/sessions/{id}/video/{viewer}:
@@ -156,6 +163,25 @@ paths:
       operationId: companionPairingStatus
       responses:
         '200': {description: Current pairing status (waiting, paired, or expired)}
+  /v1/companion/gesture-target/{id}:
+    parameters: [{$ref: '#/components/parameters/id'}]
+    get:
+      operationId: companionGestureTarget
+      responses:
+        '200': {description: Linked enrolled Android ADB device, or an empty target_device_id}
+    put:
+      operationId: setCompanionGestureTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_device_id]
+              properties:
+                target_device_id: {type: string}
+      responses:
+        '200': {description: Companion and enrolled Android control device linked}
   /v1/companion/{id}:
     parameters: [{$ref: '#/components/parameters/id'}]
     delete:

@@ -65,6 +65,13 @@ func (s *Service) Operation(ctx context.Context, actor wire.Actor, session strin
 		slog.Error("Operation journal update failed", "operation", request.ID)
 		return wire.Result{ID: request.ID, State: wire.Unknown, Fault: wire.ErrUnknown}, nil
 	}
+	if result.State == wire.Succeeded && request.Kind == "act" && request.Action != nil && len(request.Action.GesturePaths()) > 0 {
+		if publisher, ok := s.Hub.Companion.(interface {
+			PublishGesture(context.Context, store.Target, wire.Action)
+		}); ok {
+			publisher.PublishGesture(finishCtx, ticket.Target, *request.Action)
+		}
+	}
 	switch result.State {
 	case wire.Succeeded:
 		s.Succeeded.Add(1)

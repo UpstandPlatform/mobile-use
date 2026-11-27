@@ -65,7 +65,7 @@ func (s *Service) Operation(ctx context.Context, actor wire.Actor, session strin
 		slog.Error("Operation journal update failed", "operation", request.ID)
 		return wire.Result{ID: request.ID, State: wire.Unknown, Fault: wire.ErrUnknown}, nil
 	}
-	if result.State == wire.Succeeded && request.Kind == "act" && request.Action != nil && len(request.Action.GesturePaths()) > 0 {
+	if result.State == wire.Succeeded && request.Kind == "act" && request.Action != nil {
 		if publisher, ok := s.Hub.Companion.(interface {
 			PublishGesture(context.Context, store.Target, wire.Action)
 		}); ok {
@@ -80,7 +80,7 @@ func (s *Service) Operation(ctx context.Context, actor wire.Actor, session strin
 	default:
 		s.Failed.Add(1)
 	}
-	if result.Observation != nil || result.Page != nil || result.Apps != nil || result.Contexts != nil || result.Sensor != nil || result.Artifact != nil {
+	if result.Observation != nil || result.Page != nil || result.Apps != nil || result.InstalledApps != nil || result.Contexts != nil || result.Sensor != nil || result.Artifact != nil {
 		if err := s.Store.Confirm(finishCtx, ticket.Target, time.Now()); err != nil {
 			return wire.Result{}, wire.ErrExpired
 		}

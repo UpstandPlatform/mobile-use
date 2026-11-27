@@ -287,12 +287,17 @@ export function McpSetup({
         <CircleHelp />
         <AlertTitle>What can an agent do?</AlertTitle>
         <AlertDescription>
-          Tools depend on device mode and the capabilities granted to that agent. Screen, touch, app
-          discovery, keyboard input, navigation, and approved app installs are controlled by per-device grants
-          and session approval. Use <code>ui_find</code> and <code>ui_action</code> for accessibility-aware
-          targeting, and <code>touch_gesture</code> for coordinate and multi-touch gestures when advertised.
-          Android multi-touch needs the ADB helper enabled on the workstation. The Android companion currently
-          shares its screen and approved sensors; input, UI-tree, and app controls require ADB or Appium.
+          In Codex, once the <code>mobile-use</code> MCP server is connected, ask normally—for example, “Use
+          mobile-use to open Instagram on my phone.” The agent can find the paired device, request the Apps
+          capability, wait for your approval on Android, match the app name to its package ID, and open it.
+          Each action still requires an approved session.
+          <br /><br />
+          The Android companion lists and opens apps after pairing. Enable its mobile-use accessibility service
+          in Android Settings to add the UI tree, touch gestures, text input, navigation, and browser controls
+          over local Wi-Fi or remote HTTPS. Screen capture is approved separately on the phone. The phone must
+          be unlocked for screen reading and interaction. Browser inspection uses the visible accessibility tree,
+          not full DOM access. App force-stop, arbitrary APK installation, and app-data reset use the ADB
+          connector. iPhone features require the configured Appium/WebDriverAgent connector.
         </AlertDescription>
       </Alert>
     </div>

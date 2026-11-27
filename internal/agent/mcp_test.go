@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -48,6 +49,9 @@ func TestMCPPublishesMobileComputerUseTools(t *testing.T) {
 	available := make(map[string]bool, len(listed.Tools))
 	for _, tool := range listed.Tools {
 		available[tool.Name] = true
+		if tool.Name == "apps_list" && !strings.Contains(tool.Description, "companion") {
+			t.Error("apps_list does not explain companion app discovery")
+		}
 	}
 	for _, name := range want {
 		if !available[name] {

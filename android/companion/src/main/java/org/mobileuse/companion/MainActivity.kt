@@ -68,6 +68,8 @@ class MainActivity : ComponentActivity() {
     private var online by mutableStateOf(false)
     private var backgroundMonitorEnabled by mutableStateOf(false)
     private var gesturePointerEnabled by mutableStateOf(false)
+    private var accessibilityControlEnabled by mutableStateOf(false)
+    private var controlSessionId: String? = null
     private var notificationsAvailable by mutableStateOf(false)
     private var backgroundNotificationsPending = false
     private var gesturePointerPermissionPending = false
@@ -149,6 +151,7 @@ class MainActivity : ComponentActivity() {
         lanDiscovery = LanDiscovery(this)
         pairing = store.read()
         gesturePointerEnabled = GesturePointerSettings.enabled(this)
+        accessibilityControlEnabled = DeviceAccessibilityService.isConnected()
         CompanionNotifications.createChannels(this)
         notificationsAvailable = CompanionNotifications.notificationsAllowed(this)
         BackgroundConnectionSettings.refresh(this)
@@ -169,10 +172,11 @@ class MainActivity : ComponentActivity() {
                     } else {
                         lanDiscovery.stop()
                         try {
-                            val value = withContext(Dispatchers.IO) { CompanionApi(current).heartbeat(attending) }
+                            val value = withContext(Dispatchers.IO) { CompanionApi(current).heartbeat(attending, PhoneControlCapabilities.current(this@MainActivity)) }
                             if (pairing == current) {
                                 status = value
                                 online = true
+                                syncControlSession(value)
                                 if (attending != null && value.sessions.none { it.id == attending && it.state == "active" }) attending = null
                             }
                         } catch (cancelled: CancellationException) { throw cancelled }
@@ -239,6 +243,8 @@ class MainActivity : ComponentActivity() {
         BackgroundConnectionSettings.refresh(this)
         backgroundMonitorEnabled = BackgroundConnectionSettings.enabled(this)
         gesturePointerEnabled = GesturePointerSettings.enabled(this)
+        accessibilityControlEnabled = DeviceAccessibilityService.isConnected()
+        pairing?.let { syncControlSession(status) }
         if (gesturePointerPermissionPending) {
             gesturePointerPermissionPending = false
             if (Settings.canDrawOverlays(this)) {
@@ -290,6 +296,25 @@ class MainActivity : ComponentActivity() {
         } else {
             message = "Background connection is on. Android will show an ongoing notification."
         }
+    }
+
+    private fun syncControlSession(heartbeat: Heartbeat) {
+        accessibilityControlEnabled = DeviceAccessibilityService.isConnected()
+        val active = heartbeat.sessions.firstOrNull { session ->
+            session.state == "active" && !session.paused && session.caps.any { it in setOf("ui_tree", "touch", "text", "apps", "browser") }
+        }
+        if (active?.id == controlSessionId) return
+        ControlSessionService.stop(this)
+        controlSessionId = active?.id
+        if (active != null && pairing != null) {
+            runCatching { ControlSessionService.start(this, active.id) }
+                .onFailure { message = "The approved control service could not start. Allow notifications and try again." }
+        }
+    }
+
+    private fun openAccessibilitySettings() {
+        runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            .onFailure { message = "Open Android Settings → Accessibility to enable mobile-use device control." }
     }
 
     private fun openBatterySettings() {
@@ -464,6 +489,10 @@ class MainActivity : ComponentActivity() {
         livePermission = null
         micJob?.cancel()
         ScreenShareService.stop(this)
+        if (controlSessionId == id) {
+            ControlSessionService.stop(this)
+            controlSessionId = null
+        }
         if (SensorSharing.camera.value == id) SensorShareService.stop(this, MediaSource.CAMERA)
         if (SensorSharing.microphone.value == id) SensorShareService.stop(this, MediaSource.MICROPHONE)
         Sharing.error.value = null
@@ -867,6 +896,25 @@ class MainActivity : ComponentActivity() {
                         }
                         ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Agent device control", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (accessibilityControlEnabled) "Accessibility control is enabled. Approved sessions can inspect the UI tree, tap, type, navigate, and interact with browser pages."
+                                    else "Installed app discovery and launch are available. Enable Android accessibility to add UI-tree, touch, text, navigation, and browser control.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                Text(
+                                    "The service reads the visible interface only when an approved session asks it to. Android keeps control available while the session notification is active. Unlock the phone before screen actions.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = colors.onSurfaceVariant,
+                                )
+                                OutlinedButton(onClick = ::openAccessibilitySettings) {
+                                    Text(if (accessibilityControlEnabled) "Manage accessibility access" else "Enable accessibility control")
+                                }
+                            }
+                        }
+                        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Row(
                                     Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -904,8 +952,24 @@ class MainActivity : ComponentActivity() {
                                     Text(item.purpose, style = MaterialTheme.typography.titleMedium)
                                     Text(item.requester, color = colors.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                                     Text(item.caps.joinToString(" · ") { it.replace('_', ' ').replaceFirstChar(Char::uppercase) }, style = MaterialTheme.typography.bodySmall)
+                                    if (item.caps.any { it in setOf("ui_tree", "touch", "text", "apps", "browser") }) Text(
+                                        "This session can control the capabilities shown above. Stop the session here or in the console to revoke access.",
+                                        color = colors.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
                                     if (item.state == "pending_approval") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(enabled = online && !busy, onClick = { execute { it.session(item.id, "approve"); withContext(Dispatchers.Main) { attending = item.id } } }) { Text("Approve") }
+                                        Button(enabled = online && !busy, onClick = {
+                                            execute {
+                                                it.session(item.id, "approve")
+                                                withContext(Dispatchers.Main) {
+                                                    attending = item.id
+                                                    if (item.caps.any { cap -> cap in setOf("ui_tree", "touch", "text", "apps", "browser") }) {
+                                                        controlSessionId = item.id
+                                                        ControlSessionService.start(this@MainActivity, item.id)
+                                                    }
+                                                }
+                                            }
+                                        }) { Text("Approve") }
                                         TextButton(enabled = online && !busy, onClick = { execute { it.session(item.id, "deny") } }) { Text("Deny") }
                                     } else if (item.state == "active") {
                                         if (sharing == item.id) {
@@ -975,6 +1039,8 @@ class MainActivity : ComponentActivity() {
                     SensorSharing.error.value = null
                     BackgroundMonitorService.setEnabled(this@MainActivity, false)
                     backgroundMonitorEnabled = false
+                    ControlSessionService.stop(this@MainActivity)
+                    controlSessionId = null
                     val previous = pairing
                     store.clear(); pairing = null; attending = null
                     online = false

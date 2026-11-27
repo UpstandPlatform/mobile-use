@@ -342,16 +342,23 @@ type BrowserElement struct {
 	Type  string `json:"type,omitempty"`
 }
 
+type AppInfo struct {
+	ID         string `json:"id"`
+	Name       string `json:"name,omitempty"`
+	Launchable bool   `json:"launchable,omitempty"`
+}
+
 type Result struct {
-	ID          string           `json:"id"`
-	State       string           `json:"state"`
-	Observation *Observation     `json:"observation,omitempty"`
-	Apps        []string         `json:"apps,omitempty"`
-	Contexts    []BrowserContext `json:"contexts,omitempty"`
-	Page        *BrowserPage     `json:"page,omitempty"`
-	Fault       *Fault           `json:"error,omitempty"`
-	Sensor      *SensorStatus    `json:"sensor,omitempty"`
-	Artifact    *Image           `json:"artifact,omitempty"`
+	ID            string           `json:"id"`
+	State         string           `json:"state"`
+	Observation   *Observation     `json:"observation,omitempty"`
+	Apps          []string         `json:"apps,omitempty"`
+	InstalledApps []AppInfo        `json:"installed_apps,omitempty"`
+	Contexts      []BrowserContext `json:"contexts,omitempty"`
+	Page          *BrowserPage     `json:"page,omitempty"`
+	Fault         *Fault           `json:"error,omitempty"`
+	Sensor        *SensorStatus    `json:"sensor,omitempty"`
+	Artifact      *Image           `json:"artifact,omitempty"`
 }
 
 const (
@@ -521,7 +528,7 @@ func (op Operation) Required() ([]Capability, error) {
 		if !ValidID(op.AppID) || !strings.Contains(op.AppID, ".") {
 			return nil, invalid
 		}
-		return []Capability{Apps, Touch}, nil
+		return []Capability{Apps}, nil
 	case "app_install", "app_reset":
 		request := op.Maintenance
 		verb := "install"

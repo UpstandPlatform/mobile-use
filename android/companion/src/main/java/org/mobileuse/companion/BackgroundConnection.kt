@@ -51,9 +51,11 @@ internal object CompanionNotifications {
     private const val PREF_CONNECTION = "last_connection"
     private const val PREF_SCREEN_ERROR = "last_screen_error"
     const val MONITOR_CHANNEL = "background-connection"
+    const val CONTROL_CHANNEL = "approved-device-control"
     private const val REQUEST_CHANNEL = "access-requests"
     private const val ALERT_CHANNEL = "connection-alerts"
     const val MONITOR_NOTIFICATION_ID = 201
+    const val CONTROL_NOTIFICATION_ID = 202
     private const val SCREEN_ERROR_NOTIFICATION_ID = 203
     private val lock = Any()
 
@@ -68,6 +70,12 @@ internal object CompanionNotifications {
         manager.createNotificationChannel(
             NotificationChannel(MONITOR_CHANNEL, "Background connection", NotificationManager.IMPORTANCE_LOW).apply {
                 description = "Shows when mobile-use is keeping session requests available in the background."
+                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(CONTROL_CHANNEL, "Approved device control", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Shows while an approved session can control this phone."
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
             },
         )
@@ -105,6 +113,21 @@ internal object CompanionNotifications {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(Notification.Action.Builder(null, "Turn off", stop).build())
+            .build()
+    }
+
+    fun controlNotification(context: Context, stop: PendingIntent): Notification {
+        createChannels(context)
+        return Notification.Builder(context, CONTROL_CHANNEL)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Approved mobile-use session")
+            .setContentText("The agent can use the capabilities you approved. Tap Stop to end access.")
+            .setContentIntent(openIntent(context, "control"))
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .addAction(Notification.Action.Builder(null, "Stop session", stop).build())
             .build()
     }
 
@@ -313,8 +336,11 @@ class BackgroundMonitorService : Service() {
                 api = CompanionApi(pairing)
             }
             try {
-                val heartbeat = api!!.heartbeat(null)
+                val heartbeat = api!!.heartbeat(null, PhoneControlCapabilities.current(this@BackgroundMonitorService))
                 CompanionNotifications.syncRequests(this, heartbeat)
+                heartbeat.sessions.firstOrNull { session ->
+                    session.state == "active" && !session.paused && session.caps.any { it in setOf("ui_tree", "touch", "text", "apps", "browser") }
+                }?.let { session -> runCatching { ControlSessionService.start(this@BackgroundMonitorService, session.id) } }
                 CompanionNotifications.connectionChanged(this, true)
                 connectionText = "Connected · session requests and alerts are on."
                 getSystemService(NotificationManager::class.java).notify(

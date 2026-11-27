@@ -43,8 +43,10 @@ type Companion struct {
 
 	mu             sync.Mutex
 	frames         map[string]phoneFrame
+	controlFrames  map[string]map[string]companionControlFrame
 	frameSubs      map[string]map[chan frameEvent]struct{}
 	gestureSubs    map[string]map[chan gestureEvent]gestureSubscriber
+	controlSubs    map[string]*controlSubscriber
 	gestureEnabled map[string]bool
 	media          map[companionMediaKey]*companionMediaFeed
 	requests       map[string]sensorEntry
@@ -55,6 +57,15 @@ type phoneFrame struct {
 	observation wire.Observation
 	session     string
 	generation  int64
+}
+
+type companionControlFrame struct {
+	at         time.Time
+	session    string
+	generation int64
+	width      int
+	height     int
+	nodes      map[string]wire.Node
 }
 
 type frameEvent struct {
@@ -77,8 +88,10 @@ func NewCompanion(db *store.Store, origin string) *Companion {
 		AllowedOrigins: []string{origin},
 		Mode:           "remote",
 		frames:         make(map[string]phoneFrame),
+		controlFrames:  make(map[string]map[string]companionControlFrame),
 		frameSubs:      make(map[string]map[chan frameEvent]struct{}),
 		gestureSubs:    make(map[string]map[chan gestureEvent]gestureSubscriber),
+		controlSubs:    make(map[string]*controlSubscriber),
 		gestureEnabled: make(map[string]bool),
 		requests:       make(map[string]sensorEntry),
 		attempts:       make(map[string][]time.Time),
@@ -352,7 +365,7 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 				if wire.ValidID(subj) {
 					grants = append(grants, wire.Grant{
 						Subject:      subj,
-						Capabilities: []wire.Capability{wire.Screen, wire.Camera, wire.Microphone},
+						Capabilities: []wire.Capability{wire.Screen, wire.Camera, wire.Microphone, wire.Tree, wire.Touch, wire.Text, wire.Apps, wire.Browser, wire.MultiTouch},
 					})
 				}
 			}
@@ -385,15 +398,33 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 	})
 	router.HandleFunc("POST /companion/heartbeat", c.phone(func(w http.ResponseWriter, r *http.Request, phone store.Companion) {
 		var req struct {
-			Present string `json:"present_session"`
+			Present      string            `json:"present_session"`
+			Capabilities []wire.Capability `json:"capabilities"`
 		}
 		if !readJSON(w, r, &req) {
+			return
+		}
+		controlCaps := wire.Capabilities{}
+		for _, capability := range req.Capabilities {
+			switch capability {
+			case wire.Tree, wire.Touch, wire.Text, wire.Apps, wire.Browser, wire.MultiTouch:
+				controlCaps[capability] = true
+			default:
+				writeError(w, wire.Error("INVALID_CAPABILITY", "The companion advertised an unsupported control capability.", http.StatusBadRequest))
+				return
+			}
+		}
+		if controlCaps[wire.MultiTouch] && !controlCaps[wire.Touch] {
+			writeError(w, wire.Error("INVALID_CAPABILITY", "Multi-touch requires touch control.", http.StatusBadRequest))
 			return
 		}
 		actor := ownerActor(phone)
 		ctx := r.Context()
 		now := time.Now()
 		caps := wire.Capabilities{wire.Screen: true, wire.Camera: true, wire.Microphone: true}
+		for capability := range controlCaps {
+			caps[capability] = true
+		}
 		id := phoneConnector(phone.ID)
 		liveVideo := r.Header.Get("X-Mobile-Use-Media") == "1"
 		if err := c.Store.Register(ctx, phone.Workspace, id, []wire.Inventory{{ID: phone.ID, Label: phone.Label, Platform: "android", Mode: "companion", Capabilities: caps, LiveVideo: liveVideo}}, now); err != nil {
@@ -483,6 +514,7 @@ func (c *Companion) PhoneRoutes(router *http.ServeMux) {
 		writeJSON(w, 200, entry.status)
 	}))
 	router.HandleFunc("POST /companion/sensors/{id}/artifact", c.phone(c.uploadArtifact))
+	c.ControlPhoneRoutes(router)
 }
 
 func (c *Companion) PhoneHandler() http.Handler {
@@ -499,11 +531,17 @@ func (c *Companion) ensureMapsLocked() {
 	if c.frames == nil {
 		c.frames = make(map[string]phoneFrame)
 	}
+	if c.controlFrames == nil {
+		c.controlFrames = make(map[string]map[string]companionControlFrame)
+	}
 	if c.frameSubs == nil {
 		c.frameSubs = make(map[string]map[chan frameEvent]struct{})
 	}
 	if c.gestureSubs == nil {
 		c.gestureSubs = make(map[string]map[chan gestureEvent]gestureSubscriber)
+	}
+	if c.controlSubs == nil {
+		c.controlSubs = make(map[string]*controlSubscriber)
 	}
 	if c.gestureEnabled == nil {
 		c.gestureEnabled = make(map[string]bool)
@@ -886,7 +924,140 @@ func (c *Companion) uploadArtifact(w http.ResponseWriter, r *http.Request, phone
 	writeJSON(w, 200, entry.status)
 }
 
-func (c *Companion) Dispatch(_ context.Context, target store.Target, command wire.Dispatch) (wire.Result, error) {
+func (c *Companion) observeControl(ctx context.Context, target store.Target, command wire.Dispatch) (wire.Result, error) {
+	request := command.Operation.Observe
+	if request == nil {
+		return wire.Result{}, wire.ErrUnsupported
+	}
+	var observation wire.Observation
+	if request.Tree || request.WaitFor != "" {
+		response, err := c.dispatchControl(ctx, target, command)
+		if err != nil {
+			return wire.Result{}, err
+		}
+		if response.Observation == nil {
+			return wire.Result{}, wire.ErrUnknown
+		}
+		observation = *response.Observation
+	}
+	var image *wire.Image
+	if request.Screen {
+		c.mu.Lock()
+		frame, ok := c.frames[target.Device]
+		c.mu.Unlock()
+		if !ok || frame.session != target.Session || frame.generation != target.Generation || time.Since(frame.observation.CapturedAt) > 3*time.Second || frame.observation.Image == nil {
+			return wire.Result{}, wire.Error("SHARING_INACTIVE", "Start screen sharing in the companion app and approve Android’s screen-capture prompt.", http.StatusConflict)
+		}
+		image = frame.observation.Image
+		if !request.Tree {
+			observation = frame.observation
+		}
+	}
+	if request.Screen {
+		observation.Image = image
+		if width, height, err := connector.ImageDimensions(image.Data); err == nil {
+			if request.Tree && observation.Width > 0 && observation.Height > 0 {
+				scaleX, scaleY := float64(width)/float64(observation.Width), float64(height)/float64(observation.Height)
+				for index := range observation.Nodes {
+					node := &observation.Nodes[index]
+					node.Bounds.X = int(float64(node.Bounds.X) * scaleX)
+					node.Bounds.Y = int(float64(node.Bounds.Y) * scaleY)
+					node.Bounds.Width = int(float64(node.Bounds.Width) * scaleX)
+					node.Bounds.Height = int(float64(node.Bounds.Height) * scaleY)
+				}
+			}
+			observation.Width, observation.Height = width, height
+		}
+	}
+	if observation.Width < 1 || observation.Height < 1 {
+		return wire.Result{}, wire.Error("OBSERVATION_UNAVAILABLE", "The phone did not return usable screen dimensions. Unlock the phone and observe again.", http.StatusConflict)
+	}
+	if request.Tree || !wire.ValidID(observation.FrameID) {
+		observation.FrameID = wire.NewID()
+	}
+	if observation.CapturedAt.IsZero() || request.Tree {
+		observation.CapturedAt = time.Now()
+	}
+	nodes := make(map[string]wire.Node, len(observation.Nodes))
+	for index := range observation.Nodes {
+		node := observation.Nodes[index]
+		if wire.ValidID(node.ID) {
+			node.VisibilityKnown = true
+			observation.Nodes[index].VisibilityKnown = true
+			nodes[node.ID] = node
+		}
+	}
+	frame := companionControlFrame{
+		at: observation.CapturedAt, session: target.Session, generation: target.Generation,
+		width: observation.Width, height: observation.Height, nodes: nodes,
+	}
+	c.mu.Lock()
+	c.ensureMapsLocked()
+	if c.controlFrames[target.Device] == nil {
+		c.controlFrames[target.Device] = make(map[string]companionControlFrame)
+	}
+	for id, old := range c.controlFrames[target.Device] {
+		if time.Since(old.at) > 15*time.Second || len(c.controlFrames[target.Device]) >= 8 {
+			delete(c.controlFrames[target.Device], id)
+		}
+	}
+	c.controlFrames[target.Device][observation.FrameID] = frame
+	c.mu.Unlock()
+	return wire.Result{ID: command.Operation.ID, State: wire.Succeeded, Observation: &observation}, nil
+}
+
+func (c *Companion) dispatchControl(ctx context.Context, target store.Target, command wire.Dispatch) (wire.Result, error) {
+	op := command.Operation
+	if op.Kind == "act" {
+		frameID := op.Action.FrameID
+		c.mu.Lock()
+		frame, ok := c.controlFrames[target.Device][frameID]
+		if ok && (frame.session != target.Session || frame.generation != target.Generation || time.Since(frame.at) > 15*time.Second) {
+			delete(c.controlFrames[target.Device], frameID)
+			ok = false
+		}
+		if ok && op.Action.NodeID != "" {
+			node, exists := frame.nodes[op.Action.NodeID]
+			ok = exists && node.Enabled && node.Visible
+		}
+		c.mu.Unlock()
+		if !ok {
+			return wire.Result{}, wire.ErrStale
+		}
+	}
+	if err := c.Store.Confirm(ctx, target, time.Now()); err != nil {
+		return wire.Result{}, err
+	}
+	c.mu.Lock()
+	subscriber := c.controlSubs[target.Device]
+	if subscriber != nil && (subscriber.session != target.Session || subscriber.generation != target.Generation) {
+		subscriber = nil
+	}
+	if op.Kind == "app_launch" || op.Kind == "app_terminate" || op.Kind == "browser_act" {
+		clear(c.controlFrames[target.Device])
+	}
+	c.mu.Unlock()
+	if subscriber == nil {
+		return wire.Result{}, wire.Error("PHONE_CONTROL_OFFLINE", "Open the companion app, enable Android accessibility control, and keep the approved session active.", http.StatusServiceUnavailable)
+	}
+	result, err := subscriber.request(ctx, command)
+	if err != nil {
+		return wire.Result{}, err
+	}
+	if result.ID != op.ID || result.State != wire.Succeeded && result.State != wire.Failed && result.State != wire.Unknown {
+		return wire.Result{}, wire.ErrUnknown
+	}
+	return result, nil
+}
+
+func (c *Companion) Dispatch(ctx context.Context, target store.Target, command wire.Dispatch) (wire.Result, error) {
+	if command.Operation.Kind == "observe" {
+		return c.observeControl(ctx, target, command)
+	}
+	switch command.Operation.Kind {
+	case "act", "apps_list", "app_launch", "app_terminate", "browser_contexts", "browser_observe", "browser_act":
+		return c.dispatchControl(ctx, target, command)
+	}
 	result := wire.Result{ID: command.Operation.ID, State: wire.Succeeded}
 	now := time.Now()
 	op := command.Operation
@@ -937,7 +1108,6 @@ func (c *Companion) Dispatch(_ context.Context, target store.Target, command wir
 
 func (c *Companion) Stop(target store.Target) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.ensureMapsLocked()
 	c.stopMediaLocked(target)
 	if target.Session == "" {
@@ -947,10 +1117,25 @@ func (c *Companion) Stop(target store.Target) {
 		delete(c.frames, target.Device)
 		c.publishEventLocked(target.Device, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
 	}
+	for frameID, frame := range c.controlFrames[target.Device] {
+		if target.Session == "" || frame.session == target.Session {
+			delete(c.controlFrames[target.Device], frameID)
+		}
+	}
+	subscriber := c.controlSubs[target.Device]
+	if subscriber != nil && (target.Session == "" || subscriber.session == target.Session) {
+		delete(c.controlSubs, target.Device)
+	} else {
+		subscriber = nil
+	}
 	for id, entry := range c.requests {
 		if entry.workspace == target.Workspace && entry.device == target.Device && (entry.status.SessionID == target.Session || target.Session == "") {
 			delete(c.requests, id)
 		}
+	}
+	c.mu.Unlock()
+	if subscriber != nil {
+		subscriber.close(wire.ErrExpired)
 	}
 }
 
@@ -959,6 +1144,16 @@ func (c *Companion) sweepLocked(now time.Time) {
 		if now.Sub(frame.observation.CapturedAt) > 3*time.Second {
 			delete(c.frames, id)
 			c.publishEventLocked(id, frameEvent{kind: "status", data: []byte(`{"state":"waiting"}`)})
+		}
+	}
+	for device, frames := range c.controlFrames {
+		for id, frame := range frames {
+			if now.Sub(frame.at) > 15*time.Second {
+				delete(frames, id)
+			}
+		}
+		if len(frames) == 0 {
+			delete(c.controlFrames, device)
 		}
 	}
 	for id, entry := range c.requests {

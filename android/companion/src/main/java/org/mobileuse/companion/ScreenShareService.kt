@@ -108,7 +108,7 @@ class ScreenShareService : Service() {
             if (id != null && client != null && checking.compareAndSet(false, true)) {
                 control.submit {
                     try {
-                        val current = client.heartbeat(id)
+                        val current = client.heartbeat(id, PhoneControlCapabilities.current(this@ScreenShareService))
                         CompanionNotifications.syncRequests(this@ScreenShareService, current)
                         CompanionNotifications.connectionChanged(this@ScreenShareService, true)
                         if (current.sessions.none { it.id == id && it.state == "active" }) stopSelf()

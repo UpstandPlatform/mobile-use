@@ -392,6 +392,16 @@ components:
             nodes: {type: array, items: {$ref: '#/components/schemas/UINode'}}
             partial: {type: array, items: {type: string}}
         apps: {type: array, items: {type: string}}
+        installed_apps:
+          type: array
+          description: Android companion display names and launchable package IDs when available.
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: {type: string}
+              name: {type: string}
+              launchable: {type: boolean}
         contexts: {type: array, items: {type: object}}
         page: {type: object}
         sensor: {type: object}

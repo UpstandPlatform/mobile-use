@@ -764,7 +764,11 @@ function App() {
                               <AlertDescription>
                                 {device.mode === 'companion'
                                   ? device.online
-                                    ? 'The request is waiting on the phone. After approval, start screen sharing in the companion and accept Android’s capture prompt before frames appear here.'
+                                    ? pending.capabilities.includes('screen')
+                                      ? 'The request is waiting on the phone. After approval, start screen sharing in the companion and accept Android’s capture prompt before frames appear here.'
+                                      : pending.capabilities.some((capability) => ['ui_tree', 'touch', 'text', 'browser'].includes(capability))
+                                        ? 'The request is waiting on the phone. UI controls need mobile-use accessibility enabled in Android Settings and an unlocked phone; they do not need screen sharing.'
+                                        : 'The request is waiting on the phone. App discovery and launch do not need screen sharing.'
                                     : 'The request is saved on the server and will reach the phone when the companion reconnects.'
                                   : 'The request is waiting for owner approval. After approval, the workstation connector can capture the device screen.'}
                                 <div className="mt-2 grid gap-1 text-xs">
@@ -1696,14 +1700,14 @@ function StartForm({
       : '';
   const options = Object.keys(device.capabilities).filter((cap) => device.capabilities[cap]);
   const [selected, setSelected] = useState(
-    options.filter((cap) => ['screen', 'touch', 'ui_tree', 'text'].includes(cap)),
+    options.includes('apps') ? ['apps'] : options.includes('screen') ? ['screen'] : [],
   );
   return (
     <Card>
       <CardHeader>
         <CardTitle className="text-base">Request a device session</CardTitle>
         <CardDescription>
-          The phone owner reviews this request. The Android companion also needs screen sharing started and its capture prompt approved on the phone.
+          The phone owner reviews every request. Screen sharing and Android’s capture prompt are needed only when you request Screen.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1752,6 +1756,11 @@ function StartForm({
           <fieldset className="grid gap-3" aria-invalid={attempted && selected.length === 0}>
             <legend className="text-sm font-medium">Requested capabilities</legend>
             <p className="text-sm text-muted-foreground">Select the smallest set needed for this task.</p>
+            {device.mode === 'companion' && device.platform === 'android' && (
+              <p className="text-sm text-muted-foreground">
+                Apps can be listed and opened after approval. Enable mobile-use under Android Settings → Accessibility for UI tree, touch, text, navigation, and browser controls; keep the phone unlocked while using them.
+              </p>
+            )}
             {options.length > 0 ? (
               <div className="grid gap-2 sm:grid-cols-2">
               {options.map((cap) => (

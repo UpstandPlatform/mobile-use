@@ -161,11 +161,35 @@ func (c *Companion) unsubscribeGestures(device string, channel chan gestureEvent
 
 func (c *Companion) PublishGesture(ctx context.Context, target store.Target, action wire.Action) {
 	paths := action.GesturePaths()
-	if len(paths) == 0 || len(paths) > 5 {
-		return
+	companionID := ""
+	if target.Connector == phoneConnector(target.Device) {
+		companionID = target.Device
+	} else {
+		var err error
+		companionID, err = c.Store.CompanionForControlDevice(ctx, target.Workspace, target.Device)
+		if err != nil || companionID == "" {
+			return
+		}
 	}
-	companionID, err := c.Store.CompanionForControlDevice(ctx, target.Workspace, target.Device)
-	if err != nil || companionID == "" {
+	if target.Connector == phoneConnector(target.Device) {
+		c.mu.Lock()
+		if frame, ok := c.controlFrames[target.Device][action.FrameID]; ok {
+			if action.NodeID != "" && frame.width > 0 && frame.height > 0 {
+				if node, exists := frame.nodes[action.NodeID]; exists {
+					paths = []wire.TouchPath{{
+						Start: wire.Point{X: (float64(node.Bounds.X) + float64(node.Bounds.Width)/2) / float64(frame.width), Y: (float64(node.Bounds.Y) + float64(node.Bounds.Height)/2) / float64(frame.height)},
+						End:   wire.Point{X: (float64(node.Bounds.X) + float64(node.Bounds.Width)/2) / float64(frame.width), Y: (float64(node.Bounds.Y) + float64(node.Bounds.Height)/2) / float64(frame.height)},
+					}}
+				}
+			}
+			delete(c.controlFrames[target.Device], action.FrameID)
+			if len(c.controlFrames[target.Device]) == 0 {
+				delete(c.controlFrames, target.Device)
+			}
+		}
+		c.mu.Unlock()
+	}
+	if len(paths) == 0 || len(paths) > 5 {
 		return
 	}
 	duration := action.DurationMS

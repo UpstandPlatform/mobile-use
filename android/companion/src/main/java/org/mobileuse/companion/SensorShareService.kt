@@ -110,7 +110,7 @@ abstract class SensorShareService : Service() {
                 }
                 if (checking.compareAndSet(false, true)) control.submit {
                     try {
-                        val status = api.heartbeat(id)
+                        val status = api.heartbeat(id, PhoneControlCapabilities.current(this@SensorShareService))
                         if (status.sessions.none { it.id == id && it.state == "active" && source.id in it.caps }) stopSelf()
                     } catch (error: ApiFailure) {
                         if (error.status in setOf(401, 403, 404)) stopSelf()

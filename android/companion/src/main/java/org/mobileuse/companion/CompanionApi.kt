@@ -20,7 +20,14 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 
-data class PhoneSession(val id: String, val purpose: String, val requester: String, val state: String, val caps: Set<String>)
+data class PhoneSession(
+    val id: String,
+    val purpose: String,
+    val requester: String,
+    val state: String,
+    val caps: Set<String>,
+    val paused: Boolean,
+)
 data class SensorRequest(val id: String, val sessionId: String, val type: String, val seconds: Int)
 data class Heartbeat(val sessions: List<PhoneSession>, val sensors: List<SensorRequest>)
 class ApiFailure(val status: Int, message: String) : IOException(message)
@@ -40,13 +47,20 @@ class CompanionApi(private val pairing: Pairing) {
         }
         .build()
 
-    fun heartbeat(present: String?): Heartbeat {
-        val data = JSONObject().put("present_session", present.orEmpty()).toString().toByteArray()
+    fun heartbeat(present: String?, capabilities: Set<String> = emptySet()): Heartbeat {
+        val data = JSONObject().put("present_session", present.orEmpty())
+            .put("capabilities", JSONArray(capabilities.sorted())).toString().toByteArray()
         val result = JSONObject(post("/companion/heartbeat", "application/json", data, advertiseMedia = true))
         val sessions = result.optJSONArray("sessions").objects().map {
             val caps = it.optJSONArray("capabilities") ?: JSONArray()
-            PhoneSession(it.getString("id"), it.getString("purpose"), it.getString("requester"), it.getString("state"),
-                (0 until caps.length()).map(caps::getString).toSet())
+            PhoneSession(
+                it.getString("id"),
+                it.getString("purpose"),
+                it.getString("requester"),
+                it.getString("state"),
+                (0 until caps.length()).map(caps::getString).toSet(),
+                it.optBoolean("paused", false),
+            )
         }
         val sensors = result.optJSONArray("sensors").objects().map {
             SensorRequest(it.getString("id"), it.getString("session_id"), it.getString("type"), it.optInt("duration_seconds", 5))

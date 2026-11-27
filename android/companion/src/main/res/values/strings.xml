@@ -1,0 +1,3 @@
+<resources>
+    <string name="device_accessibility_description">Lets mobile-use read the visible UI tree and perform taps, text input, and navigation only during an owner-approved session. UI labels are sent to the paired workspace when requested. Screen images require separate screen-sharing approval.</string>
+</resources>

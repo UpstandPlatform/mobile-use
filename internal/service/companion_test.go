@@ -414,6 +414,131 @@ func TestCompanionFrameWebSocketAcksFramesAndFeedsConsole(t *testing.T) {
 	}
 }
 
+func TestCompanionApprovedControlChannelSupportsAppsTreeTouchTextAndBrowser(t *testing.T) {
+	f := setup(t)
+	pairing := request[map[string]any](t, f.owner, http.MethodPost, "/v1/companion/pairing", map[string]any{
+		"auto_enroll":  true,
+		"grant_agents": []string{"agent"},
+	})
+	var phone struct {
+		DeviceID string `json:"device_id"`
+		Token    string `json:"token"`
+	}
+	opening := []byte(wire.Marshal(map[string]string{"code": pairing["code"].(string), "label": "Companion control phone"}))
+	if err := json.Unmarshal(phonePost(t, f.origin, "", "/companion/enroll", "application/json", opening, http.StatusCreated), &phone); err != nil {
+		t.Fatal(err)
+	}
+	caps := []wire.Capability{wire.Tree, wire.Touch, wire.Text, wire.Apps, wire.Browser, wire.MultiTouch}
+	phonePost(t, f.origin, phone.Token, "/companion/heartbeat", "application/json", []byte(wire.Marshal(map[string]any{"present_session": "", "capabilities": caps})), http.StatusOK)
+	session := request[wire.Session](t, f.agent, http.MethodPost, "/v1/sessions", wire.StartSession{
+		DeviceID: phone.DeviceID, Purpose: "Exercise approved companion controls", Capabilities: caps,
+	})
+	phonePost(t, f.origin, phone.Token, "/companion/sessions/"+session.ID+"/approve", "application/json", []byte(`{}`), http.StatusOK)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	socketURL := strings.Replace(f.origin, "http://", "ws://", 1) + "/companion/sessions/" + session.ID + "/control"
+	socket, _, err := websocket.DefaultDialer.DialContext(ctx, socketURL, http.Header{"Authorization": []string{"Bearer " + phone.Token}})
+	if err != nil {
+		t.Fatalf("open approved phone control stream: %v", err)
+	}
+	defer socket.Close()
+	type command struct {
+		Type     string        `json:"type"`
+		ID       string        `json:"id"`
+		Dispatch wire.Dispatch `json:"dispatch"`
+	}
+	type outcome struct {
+		result wire.Result
+		err    error
+	}
+	startOperation := func(op wire.Operation) <-chan outcome {
+		done := make(chan outcome, 1)
+		go func() {
+			var result wire.Result
+			err := f.agent.Request(ctx, http.MethodPost, "/v1/sessions/"+session.ID+"/operations", op, &result)
+			done <- outcome{result: result, err: err}
+		}()
+		return done
+	}
+	readCommand := func(want string) command {
+		t.Helper()
+		_ = socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var received command
+		if err := socket.ReadJSON(&received); err != nil {
+			t.Fatalf("read %s control command: %v", want, err)
+		}
+		if received.Type != "command" || received.Dispatch.Operation.Kind != want {
+			t.Fatalf("received control command %q (%q), want %q", received.Type, received.Dispatch.Operation.Kind, want)
+		}
+		return received
+	}
+	respond := func(received command, result wire.Result) {
+		t.Helper()
+		result.ID = received.ID
+		if result.State == "" {
+			result.State = wire.Succeeded
+		}
+		if err := socket.WriteJSON(map[string]any{"type": "result", "id": received.ID, "result": result}); err != nil {
+			t.Fatalf("write control response: %v", err)
+		}
+	}
+	wait := func(done <-chan outcome, want string) wire.Result {
+		t.Helper()
+		select {
+		case value := <-done:
+			if value.err != nil {
+				t.Fatalf("%s operation: %v", want, value.err)
+			}
+			if value.result.State != wire.Succeeded {
+				t.Fatalf("%s operation state = %q, error=%+v", want, value.result.State, value.result.Fault)
+			}
+			return value.result
+		case <-ctx.Done():
+			t.Fatalf("%s operation did not finish: %v", want, ctx.Err())
+			return wire.Result{}
+		}
+	}
+
+	done := startOperation(wire.Operation{Kind: "apps_list"})
+	appCommand := readCommand("apps_list")
+	respond(appCommand, wire.Result{Apps: []string{"com.instagram.android"}, InstalledApps: []wire.AppInfo{{ID: "com.instagram.android", Name: "Instagram", Launchable: true}}})
+	apps := wait(done, "apps_list")
+	if len(apps.InstalledApps) != 1 || apps.InstalledApps[0].Name != "Instagram" || apps.InstalledApps[0].ID != "com.instagram.android" {
+		t.Fatalf("app display names and package IDs were not preserved: %+v", apps)
+	}
+
+	done = startOperation(wire.Operation{Kind: "observe", Observe: &wire.ObserveRequest{Tree: true}})
+	treeCommand := readCommand("observe")
+	if !treeCommand.Dispatch.Operation.Observe.Tree {
+		t.Fatal("companion observe command did not request the accessibility tree")
+	}
+	phoneObservation := wire.Observation{FrameID: wire.NewID(), CapturedAt: time.Now(), Width: 100, Height: 200, Orientation: "portrait", Nodes: []wire.Node{{
+		ID: "instagram-button", Label: "Instagram", Bounds: wire.Rect{X: 10, Y: 20, Width: 30, Height: 12}, Enabled: true, Visible: true, Clickable: true,
+	}}}
+	respond(treeCommand, wire.Result{Observation: &phoneObservation})
+	observed := wait(done, "observe tree")
+	if observed.Observation == nil || len(observed.Observation.Nodes) != 1 || observed.Observation.Width != 100 {
+		t.Fatalf("phone accessibility tree was not returned: %+v", observed.Observation)
+	}
+
+	done = startOperation(wire.Operation{Kind: "act", Action: &wire.Action{Type: "tap", FrameID: observed.Observation.FrameID, NodeID: "instagram-button"}})
+	tapCommand := readCommand("act")
+	if tapCommand.Dispatch.Operation.Action.NodeID != "instagram-button" {
+		t.Fatal("semantic tap was not forwarded to the phone")
+	}
+	respond(tapCommand, wire.Result{})
+	_ = wait(done, "semantic tap")
+
+	done = startOperation(wire.Operation{Kind: "browser_contexts"})
+	browserCommand := readCommand("browser_contexts")
+	respond(browserCommand, wire.Result{Contexts: []wire.BrowserContext{{ID: "com.android.chrome", Title: "Chrome"}}})
+	browsers := wait(done, "browser contexts")
+	if len(browsers.Contexts) != 1 || browsers.Contexts[0].ID != "com.android.chrome" {
+		t.Fatalf("browser contexts were not returned: %+v", browsers.Contexts)
+	}
+}
+
 func TestSuccessfulDeviceGestureStreamsToLinkedCompanion(t *testing.T) {
 	f := setup(t)
 	pairing := request[map[string]any](t, f.owner, "POST", "/v1/companion/pairing", map[string]any{

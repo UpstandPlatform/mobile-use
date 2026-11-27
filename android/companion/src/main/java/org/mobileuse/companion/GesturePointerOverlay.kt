@@ -55,7 +55,7 @@ private fun JSONObject.toPointerPoint(): PointerPoint? {
     return PointerPoint(x.toFloat(), y.toFloat())
 }
 
-/** Draws an opt-in pointer in a secure, full-screen, click-through Android overlay. */
+/** Draws an opt-in pointer in a full-screen, click-through Android overlay. */
 internal class GesturePointerOverlay(context: Context) {
     private val appContext = context.applicationContext
     private val windowManager = context.getSystemService(WindowManager::class.java)
@@ -86,8 +86,7 @@ internal class GesturePointerOverlay(context: Context) {
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_SECURE
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,

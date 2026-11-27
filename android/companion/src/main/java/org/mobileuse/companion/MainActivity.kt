@@ -935,7 +935,7 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 Text(
-                                    "The pointer is visual only: taps pass through to the app. Android asks for display-over-other-apps access once. Secure overlay rendering keeps the pointer out of shared screen frames.",
+                                    "The pointer is visual only: taps pass through to the app. Android asks for display-over-other-apps access once. Its short animation can appear in the shared screen.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = colors.onSurfaceVariant,
                                 )
